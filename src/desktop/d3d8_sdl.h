@@ -1,0 +1,2499 @@
+// d3d8_sdl.h: D3D8 to bgfx shim. Provides D3D8 types and interfaces
+// backed by bgfx (Metal on macOS, Vulkan on Linux, D3D11 on Windows);
+// vertex transforms and falloff shading run through a bgfx shader.
+
+#pragma once
+
+#include "platform_shim.h"
+
+// stb_image declarations (implementation in sdl_main.cpp)
+extern "C" unsigned char* stbi_load_from_memory(const unsigned char*, int, int*, int*, int*, int);
+extern "C" void stbi_image_free(void*);
+
+// GL headers, pulled only for base typedefs (GLuint / GLint) that a few
+// inert leftover state structs below still reference. No GL is called under
+// bgfx; on Windows <GL/gl.h> supplies the typedefs (GLEW is not needed).
+#ifdef __APPLE__
+    #define GL_SILENCE_DEPRECATION
+    #include <OpenGL/gl3.h>
+#elif defined(_WIN32)
+        #include <windows.h>
+        #include <GL/gl.h>
+#else
+    #define GL_GLEXT_PROTOTYPES
+    #include <GL/gl.h>
+    #include <GL/glext.h>
+#endif
+
+// Ensure D3D vertex constructors are available (vertex8.h, hud.cpp)
+#ifndef DIRECT3D_VERSION
+#define DIRECT3D_VERSION 0x0800
+#endif
+#ifndef D3D_OVERLOADS
+#define D3D_OVERLOADS
+#endif
+
+// bgfx handles live on the D3D8 wrapper classes, so the types need to be
+// visible here.
+#include <bgfx/bgfx.h>
+// FF emulator program, owned in sdl_main.cpp; shadow-submit uses it.
+extern bgfx::ProgramHandle g_bgfxProgFF;
+
+// vs_ff / fs_ff uniform handles. Created at bgfx::init, mirrors the .sc layout.
+struct BgfxFFUniforms {
+    bgfx::UniformHandle u_FfWVP;          // mat4
+    bgfx::UniformHandle u_FfWorldView;    // mat4
+    bgfx::UniformHandle u_FfNormalInv;    // mat4
+    bgfx::UniformHandle u_FfFalloffFront; // vec4
+    bgfx::UniformHandle u_FfFalloffDelta; // vec4
+    bgfx::UniformHandle u_FfTFactor;      // vec4
+    bgfx::UniformHandle u_FfMatDiffuse;   // vec4
+    bgfx::UniformHandle u_FfFlags1;       // vec4 packed
+    bgfx::UniformHandle u_FfFlags2;       // vec4 packed
+    bgfx::UniformHandle u_FfViewportSize; // vec4
+    bgfx::UniformHandle u_FfFragFlags1;   // vec4 packed
+    bgfx::UniformHandle u_FfFragFlags2;   // vec4 packed
+    bgfx::UniformHandle s_tex0;           // sampler
+    bgfx::UniformHandle s_tex1;           // sampler
+};
+extern BgfxFFUniforms g_bgfxFF;
+extern bgfx::TextureHandle g_bgfxWhiteTex;
+
+// Fullscreen-quad blit program + sampler. Used by the boot anim, the media
+// player, the xCloud stream, and CRT post. Owned in sdl_main.cpp.
+extern bgfx::ProgramHandle g_bgfxProgBlit;
+extern bgfx::UniformHandle g_bgfxSamplerBlit;
+
+// Letterbox half-extents in NDC for fitting a srcW x srcH image inside a
+// dstW x dstH target: {1,1} fills, the short axis shrinks to preserve aspect.
+inline void Bgfx_AspectFitNDC(int srcW, int srcH, int dstW, int dstH,
+                              float& qw, float& qh)
+{
+    if (srcH <= 0 || dstH <= 0) { qw = qh = 1.f; return; }
+    float srcA = (float)srcW / (float)srcH;
+    float dstA = (float)dstW / (float)dstH;
+    if (srcA > dstA) { qw = 1.f; qh = dstA / srcA; }
+    else             { qh = 1.f; qw = srcA / dstA; }
+}
+
+// Submit a textured quad through g_bgfxProgBlit on `view`. qw/qh are NDC half
+// extents (see Bgfx_AspectFitNDC). Texture is sampled top-down: the top edge
+// samples V=0. The caller owns the view rect/clear. No-op if handles invalid.
+inline void Bgfx_BlitTexturedQuad(bgfx::TextureHandle tex, float qw, float qh,
+                                  bgfx::ViewId view = 0)
+{
+    if (!bgfx::isValid(tex) || !bgfx::isValid(g_bgfxProgBlit)) { bgfx::touch(view); return; }
+    bgfx::VertexLayout layout;
+    layout.begin()
+        .add(bgfx::Attrib::Position,  3, bgfx::AttribType::Float)
+        .add(bgfx::Attrib::Normal,    3, bgfx::AttribType::Float)
+        .add(bgfx::Attrib::Color0,    4, bgfx::AttribType::Uint8, true)
+        .add(bgfx::Attrib::Color1,    4, bgfx::AttribType::Uint8, true)
+        .add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float)
+        .end();
+    struct BlitVert { float px, py, pz, nx, ny, nz; uint32_t c0, c1; float u, v; };
+    const BlitVert verts[4] = {
+        { -qw, -qh, 0.f, 0,0,0, 0,0, 0.f, 1.f },
+        {  qw, -qh, 0.f, 0,0,0, 0,0, 1.f, 1.f },
+        {  qw,  qh, 0.f, 0,0,0, 0,0, 1.f, 0.f },
+        { -qw,  qh, 0.f, 0,0,0, 0,0, 0.f, 0.f },
+    };
+    const uint16_t idx[6] = { 0, 1, 2, 0, 2, 3 };
+    if (bgfx::getAvailTransientVertexBuffer(4, layout) < 4) return;
+    if (bgfx::getAvailTransientIndexBuffer(6) < 6) return;
+    bgfx::TransientVertexBuffer tvb;
+    bgfx::TransientIndexBuffer  tib;
+    bgfx::allocTransientVertexBuffer(&tvb, 4, layout);
+    memcpy(tvb.data, verts, sizeof(verts));
+    bgfx::allocTransientIndexBuffer(&tib, 6);
+    memcpy(tib.data, idx, sizeof(idx));
+    bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A);
+    bgfx::setTexture(0, g_bgfxSamplerBlit, tex);
+    bgfx::setVertexBuffer(0, &tvb, 0, 4);
+    bgfx::setIndexBuffer(&tib, 0, 6);
+    bgfx::submit(view, g_bgfxProgBlit);
+}
+
+// -------------------------------------------------------
+// D3D call-trace counters. Press F8 to dump. Storage + dump in dashapp.cpp.
+// -------------------------------------------------------
+struct D3DStateStats {
+    DWORD lastValue;
+    bool  hasValue;
+    int   totalCalls;       // every time SetRenderState was called for this state
+    int   redundantCalls;   // same value as previous call (new == prev)
+    int   filteredCalls;    // hit the shim-dead early-return switch
+};
+
+// 256 covers all D3DRS_* we use (max is around 200). 8 stages * 32 types
+// for D3DTSS_*; D3DTSS_* values currently used max out near 16.
+extern D3DStateStats g_rsStats[256];
+extern D3DStateStats g_tssStats[8 * 32];
+
+void Theseus_D3D_DumpTrace();
+void Theseus_D3D_ResetTrace();
+
+// -------------------------------------------------------
+// D3D enums and constants
+// -------------------------------------------------------
+typedef enum _D3DFORMAT {
+    D3DFMT_UNKNOWN = 0,
+    D3DFMT_A8R8G8B8 = 21,
+    D3DFMT_X8R8G8B8 = 22,
+    D3DFMT_R5G6B5 = 23,
+    D3DFMT_A4R4G4B4 = 26,
+    D3DFMT_A1R5G5B5 = 25,
+    D3DFMT_DXT1 = 0x31545844,
+    D3DFMT_DXT2 = 0x32545844,
+    D3DFMT_DXT3 = 0x33545844,
+    D3DFMT_DXT4 = 0x34545844,
+    D3DFMT_DXT5 = 0x35545844,
+    D3DFMT_D16 = 80,
+    D3DFMT_D24S8 = 75,
+    D3DFMT_INDEX16 = 101,
+    D3DFMT_INDEX32 = 102,
+    D3DFMT_L8 = 50,
+    D3DFMT_A8 = 28,
+    D3DFMT_A8L8 = 51,
+    D3DFMT_P8 = 41,
+    D3DFMT_LIN_A8R8G8B8 = 0x12, // Xbox linear formats
+    D3DFMT_LIN_X8R8G8B8 = 0x1E,
+    D3DFMT_LIN_R5G6B5 = 0x11,
+    D3DFMT_LIN_A4R4G4B4 = 0x1D,
+    D3DFMT_LIN_A1R5G5B5 = 0x10,
+    D3DFMT_LIN_L8 = 0x13,
+    D3DFMT_LIN_A8 = 0x19,
+} D3DFORMAT;
+
+typedef enum _D3DPOOL {
+    D3DPOOL_DEFAULT = 0,
+    D3DPOOL_MANAGED = 1,
+    D3DPOOL_SYSTEMMEM = 2,
+} D3DPOOL;
+
+typedef enum _D3DPRIMITIVETYPE {
+    D3DPT_POINTLIST = 1,
+    D3DPT_LINELIST = 2,
+    D3DPT_LINESTRIP = 3,
+    D3DPT_TRIANGLELIST = 4,
+    D3DPT_TRIANGLESTRIP = 5,
+    D3DPT_TRIANGLEFAN = 6,
+} D3DPRIMITIVETYPE;
+
+typedef enum _D3DTRANSFORMSTATETYPE {
+    D3DTS_VIEW = 2,
+    D3DTS_PROJECTION = 3,
+    D3DTS_WORLD = 256,
+    D3DTS_TEXTURE0 = 16,
+} D3DTRANSFORMSTATETYPE;
+
+typedef enum _D3DRENDERSTATETYPE {
+    D3DRS_ZENABLE = 7,
+    D3DRS_FILLMODE = 8,
+    D3DRS_ZWRITEENABLE = 14,
+    D3DRS_ALPHATESTENABLE = 15,
+    D3DRS_SRCBLEND = 19,
+    D3DRS_DESTBLEND = 20,
+    D3DRS_CULLMODE = 22,
+    D3DRS_ZFUNC = 23,
+    D3DRS_ALPHAREF = 24,
+    D3DRS_ALPHAFUNC = 25,
+    D3DRS_ALPHABLENDENABLE = 27,
+    D3DRS_FOGENABLE = 28,
+    D3DRS_FOGCOLOR = 34,
+    D3DRS_SPECULARENABLE = 29,
+    D3DRS_LIGHTING = 137,
+    D3DRS_AMBIENT = 139,
+    D3DRS_COLORVERTEX = 141,
+    D3DRS_TEXTUREFACTOR = 60,
+    D3DRS_WRAP0 = 128,
+    D3DRS_CLIPPING = 136,
+    D3DRS_VERTEXBLEND = 151,
+    D3DRS_MULTISAMPLEANTIALIAS = 161,
+    D3DRS_EDGEANTIALIAS = 40,
+    D3DRS_COLORWRITEENABLE = 168,
+    D3DRS_SHADEMODE = 9,
+    D3DRS_DITHERENABLE = 26,
+    D3DRS_STENCILENABLE = 52,
+    D3DRS_STENCILFAIL = 53,
+    D3DRS_STENCILZFAIL = 54,
+    D3DRS_STENCILPASS = 55,
+    D3DRS_STENCILFUNC = 56,
+    D3DRS_STENCILREF = 57,
+    D3DRS_STENCILMASK = 58,
+    D3DRS_STENCILWRITEMASK = 59,
+    D3DRS_ZBIAS = 47,
+    D3DRS_NORMALIZENORMALS = 143,
+    D3DRS_DIFFUSEMATERIALSOURCE = 145,
+    D3DRS_SPECULARMATERIALSOURCE = 146,
+    D3DRS_AMBIENTMATERIALSOURCE = 147,
+    D3DRS_EMISSIVEMATERIALSOURCE = 148,
+    D3DRS_WRAP1 = 129,
+    D3DRS_WRAP2 = 130,
+    D3DRS_WRAP3 = 131,
+    D3DRS_LOCALVIEWER = 142,
+    D3DRS_POINTSIZE = 154,
+    D3DRS_POINTSIZE_MIN = 155,
+    D3DRS_POINTSPRITEENABLE = 156,
+    D3DRS_POINTSCALEENABLE = 157,
+    D3DRS_POINTSCALE_A = 158,
+    D3DRS_POINTSCALE_B = 159,
+    D3DRS_POINTSCALE_C = 160,
+    D3DRS_FOGTABLEMODE = 35,
+    D3DRS_FOGSTART = 36,
+    D3DRS_FOGEND = 37,
+    D3DRS_FOGDENSITY = 38,
+    D3DRS_RANGEFOGENABLE = 48,
+    D3DRS_MULTISAMPLEMASK = 162,
+    D3DRS_SWATHWIDTH = 200, // Xbox-specific
+} D3DRENDERSTATETYPE;
+#define D3DSWATH_OFF 0
+#define D3DSWATH_128 1
+
+// Material color source
+#define D3DMCS_MATERIAL 0
+#define D3DMCS_COLOR1   1
+#define D3DMCS_COLOR2   2
+
+// Vertex blend
+#define D3DVBF_DISABLE 0
+
+typedef enum _D3DTEXTURESTAGESTATETYPE {
+    D3DTSS_COLOROP = 1,
+    D3DTSS_COLORARG1 = 2,
+    D3DTSS_COLORARG2 = 3,
+    D3DTSS_ALPHAOP = 4,
+    D3DTSS_ALPHAARG1 = 5,
+    D3DTSS_ALPHAARG2 = 6,
+    D3DTSS_TEXCOORDINDEX = 11,
+    D3DTSS_ADDRESSU = 13,
+    D3DTSS_ADDRESSV = 14,
+    D3DTSS_MINFILTER = 15, // D3D8 location
+    D3DTSS_MAGFILTER = 16,
+    D3DTSS_MIPFILTER = 17,
+    D3DTSS_RESULTARG = 8,
+    D3DTSS_TEXTURETRANSFORMFLAGS = 24,
+} D3DTEXTURESTAGESTATETYPE;
+
+// Blend modes, compare funcs, etc.
+#define D3DBLEND_ZERO          1
+#define D3DBLEND_ONE           2
+#define D3DBLEND_SRCALPHA      5
+#define D3DBLEND_INVSRCALPHA   6
+#define D3DBLEND_DESTALPHA     7
+#define D3DBLEND_INVDESTALPHA  8
+#define D3DCMP_ALWAYS          8
+#define D3DCMP_LESSEQUAL       4
+#define D3DCMP_LESS            2
+#define D3DCULL_NONE           1
+#define D3DCULL_CW             2
+#define D3DCULL_CCW            3
+#define D3DCLEAR_TARGET        1
+#define D3DCLEAR_ZBUFFER       2
+#define D3DCLEAR_STENCIL       4
+#define D3DTOP_DISABLE         1
+#define D3DTOP_SELECTARG1      2
+#define D3DTOP_MODULATE        4
+#define D3DTA_TEXTURE          2
+#define D3DTA_DIFFUSE          0
+#define D3DTA_CURRENT          1
+#define D3DTA_TFACTOR          3
+
+// Texture address modes
+#define D3DTADDRESS_WRAP   1
+#define D3DTADDRESS_MIRROR 2
+#define D3DTADDRESS_CLAMP  3
+
+// Z-buffer types
+#define D3DZB_FALSE 0
+#define D3DZB_TRUE  1
+
+// Shade modes
+#define D3DSHADE_FLAT    1
+#define D3DSHADE_GOURAUD 2
+
+// Stencil operations
+#define D3DSTENCILOP_KEEP    1
+#define D3DSTENCILOP_ZERO    2
+#define D3DSTENCILOP_REPLACE 3
+
+// D3DCOLOR_ARGB
+#define D3DCOLOR_ARGB(a, r, g, b) ((D3DCOLOR)(((DWORD)(a) << 24) | ((DWORD)(r) << 16) | ((DWORD)(g) << 8) | (DWORD)(b)))
+#define D3DCOLOR_RGBA(r, g, b, a) D3DCOLOR_ARGB(a, r, g, b)
+#define D3DCOLOR_XRGB(r, g, b)   D3DCOLOR_ARGB(0xFF, r, g, b)
+
+// Fill modes
+#define D3DFILL_POINT     1
+#define D3DFILL_WIREFRAME 2
+#define D3DFILL_SOLID     3
+
+// Fog modes
+#define D3DFOG_NONE   0
+#define D3DFOG_EXP    1
+#define D3DFOG_EXP2   2
+#define D3DFOG_LINEAR 3
+
+// Color write enable flags
+#define D3DCOLORWRITEENABLE_RED   1
+#define D3DCOLORWRITEENABLE_GREEN 2
+#define D3DCOLORWRITEENABLE_BLUE  4
+#define D3DCOLORWRITEENABLE_ALPHA 8
+
+// D3D SDK / device creation
+#define D3D_SDK_VERSION 120
+typedef DWORD D3DDEVTYPE;
+#define D3DDEVTYPE_HAL 1
+#define D3DPRESENT_RATE_DEFAULT 0
+#define D3DPRESENT_INTERVAL_IMMEDIATE 0x80000000
+#define D3DSWAPEFFECT_DISCARD 1
+#define D3DMULTISAMPLE_2_SAMPLES_SUPERSAMPLE_VERTICAL_LINEAR 0
+#define D3DCREATE_HARDWARE_VERTEXPROCESSING 0x00000040
+#define D3DADAPTER_DEFAULT 0
+
+// D3DXCreateTextureFromFile alias
+#define D3DXCreateTextureFromFile D3DXCreateTextureFromFileA
+
+// Texture transform flags
+#define D3DTTFF_DISABLE 0
+#define D3DTTFF_COUNT2  2
+
+// Additional texture stage state ops
+#define D3DTOP_ADD         12
+#define D3DTOP_SELECTARG2  3
+
+// Color helpers
+#define D3DCOLOR_COLORVALUE(r,g,b,a) D3DCOLOR_RGBA((DWORD)((r)*255.f),(DWORD)((g)*255.f),(DWORD)((b)*255.f),(DWORD)((a)*255.f))
+
+// D3DXCOLOR
+struct D3DXCOLOR {
+    float r, g, b, a;
+    D3DXCOLOR(){};
+    D3DXCOLOR(float _r,float _g,float _b,float _a):r(_r),g(_g),b(_b),a(_a){}
+    D3DXCOLOR(D3DCOLOR c) : r(((c>>16)&0xff)/255.f), g(((c>>8)&0xff)/255.f), b((c&0xff)/255.f), a(((c>>24)&0xff)/255.f) {}
+};
+
+// Texture filter types
+#define D3DTEXF_NONE   0
+#define D3DTEXF_POINT  1
+#define D3DTEXF_LINEAR 2
+#define D3DTEXF_ANISOTROPIC 3
+#define D3DTEXF_QUINCUNX 4
+#define D3DTEXF_GAUSSIANCUBIC 5
+
+// Extra primitive type (Xbox-specific)
+#define D3DPT_QUADLIST 8
+
+// TEXT macro
+#ifndef TEXT
+#define TEXT(x) _T(x)
+#endif
+
+// _stscanf
+#define _stscanf sscanf
+
+// D3DX mesh stubs
+#define D3DXMESH_MANAGED D3DPOOL_MANAGED
+class IDirect3DDevice8; // forward decl for DrawSubset
+class IDirect3DVertexBuffer8; // forward decl for GetVertexBuffer
+class IDirect3DIndexBuffer8;  // forward decl for GetIndexBuffer
+class ID3DXMesh {
+public:
+    ULONG refCount;
+    BYTE* m_vbData;     // vertex buffer storage
+    BYTE* m_ibData;     // index buffer storage (WORD indices)
+    DWORD m_numFaces;
+    DWORD m_numVerts;
+    DWORD m_fvf;
+    DWORD m_vertStride;
+    IDirect3DDevice8* m_dev;
+
+    ID3DXMesh() : refCount(1), m_vbData(NULL), m_ibData(NULL), m_numFaces(0), m_numVerts(0), m_fvf(0), m_vertStride(0), m_dev(NULL) {}
+    ~ID3DXMesh() { free(m_vbData); free(m_ibData); }
+
+    void Init(DWORD numFaces, DWORD numVerts, DWORD fvf, IDirect3DDevice8* dev) {
+        m_numFaces = numFaces;
+        m_numVerts = numVerts;
+        m_fvf = fvf;
+        m_dev = dev;
+        // Calculate stride from FVF
+        DWORD stride = 0;
+        if (fvf & 0x004) stride += 16; // XYZRHW
+        else if (fvf & 0x002) stride += 12; // XYZ
+        if (fvf & 0x010) stride += 12; // NORMAL
+        else if (fvf & 0x20000000) stride += 4; // NORMPACKED3
+        if (fvf & 0x040) stride += 4; // DIFFUSE
+        if (fvf & 0x080) stride += 4; // SPECULAR
+        int texCount = (fvf >> 8) & 0xF;
+        stride += texCount * 8; // each tex coord = 2 floats
+        m_vertStride = stride;
+        m_vbData = (BYTE*)calloc(numVerts, stride);
+        m_ibData = (BYTE*)calloc(numFaces * 3, sizeof(WORD));
+    }
+
+    ULONG Release() { if (--refCount == 0) { delete this; return 0; } return refCount; }
+    ULONG AddRef() { return ++refCount; }
+    HRESULT LockVertexBuffer(DWORD flags, BYTE** ppData) {
+        if (m_vbData) { *ppData = m_vbData; }
+        else { static BYTE dummy[64]={}; *ppData = dummy; }
+        return S_OK;
+    }
+    HRESULT UnlockVertexBuffer() { return S_OK; }
+    HRESULT LockIndexBuffer(DWORD flags, BYTE** ppData) {
+        if (m_ibData) { *ppData = m_ibData; }
+        else { static BYTE dummy[64]={}; *ppData = dummy; }
+        return S_OK;
+    }
+    HRESULT UnlockIndexBuffer() { return S_OK; }
+    // Defined after IDirect3DVertexBuffer8/IDirect3DIndexBuffer8 classes
+    HRESULT GetVertexBuffer(IDirect3DVertexBuffer8** ppVB);
+    HRESULT GetIndexBuffer(IDirect3DIndexBuffer8** ppIB);
+    DWORD GetNumFaces() { return m_numFaces; }
+    DWORD GetNumVertices() { return m_numVerts; }
+    HRESULT CloneMeshFVF(DWORD opts, DWORD fvf, void* dev, ID3DXMesh** ppOut) {
+        ID3DXMesh* mesh = new ID3DXMesh();
+        mesh->Init(m_numFaces, m_numVerts, fvf, (IDirect3DDevice8*)dev);
+        // Convert vertex data between FVF layouts (different strides)
+        if (m_vbData && mesh->m_vbData) {
+            DWORD srcStride = m_vertStride;
+            DWORD dstStride = mesh->m_vertStride;
+            // Helper to get offset of each FVF component
+            auto fvfLayout = [](DWORD f, DWORD* oPos, DWORD* oNorm, DWORD* oDiff, DWORD* oSpec, DWORD* oTex0) {
+                DWORD off = 0;
+                *oPos = *oNorm = *oDiff = *oSpec = *oTex0 = 0xFFFFFFFF;
+                if (f & 0x004) { *oPos = off; off += 16; }       // XYZRHW
+                else if (f & 0x002) { *oPos = off; off += 12; }  // XYZ
+                if (f & 0x010) { *oNorm = off; off += 12; }      // NORMAL
+                else if (f & 0x20000000) { *oNorm = off; off += 4; } // NORMPACKED3
+                if (f & 0x040) { *oDiff = off; off += 4; }       // DIFFUSE
+                if (f & 0x080) { *oSpec = off; off += 4; }       // SPECULAR
+                int tc = (f >> 8) & 0xF;
+                if (tc > 0) { *oTex0 = off; }
+            };
+            DWORD sPos, sNorm, sDiff, sSpec, sTex0;
+            DWORD dPos, dNorm, dDiff, dSpec, dTex0;
+            fvfLayout(m_fvf, &sPos, &sNorm, &sDiff, &sSpec, &sTex0);
+            fvfLayout(fvf,   &dPos, &dNorm, &dDiff, &dSpec, &dTex0);
+            DWORD posSize = (m_fvf & 0x004) ? 16 : 12;
+            for (DWORD v = 0; v < m_numVerts; v++) {
+                const BYTE* src = m_vbData + v * srcStride;
+                BYTE* dst = mesh->m_vbData + v * dstStride;
+                // Copy position
+                if (sPos != 0xFFFFFFFF && dPos != 0xFFFFFFFF)
+                    memcpy(dst + dPos, src + sPos, posSize);
+                // Copy normal
+                if (sNorm != 0xFFFFFFFF && dNorm != 0xFFFFFFFF) {
+                    DWORD nSz = (m_fvf & 0x010) ? 12 : 4;
+                    memcpy(dst + dNorm, src + sNorm, nSz);
+                }
+                // Copy or default diffuse
+                if (dDiff != 0xFFFFFFFF) {
+                    if (sDiff != 0xFFFFFFFF)
+                        memcpy(dst + dDiff, src + sDiff, 4);
+                    else
+                        *(DWORD*)(dst + dDiff) = 0xFFFFFFFF; // opaque white default
+                }
+                // Copy or default specular
+                if (dSpec != 0xFFFFFFFF) {
+                    if (sSpec != 0xFFFFFFFF)
+                        memcpy(dst + dSpec, src + sSpec, 4);
+                    else
+                        *(DWORD*)(dst + dSpec) = 0x00000000;
+                }
+                // Copy tex coords
+                if (sTex0 != 0xFFFFFFFF && dTex0 != 0xFFFFFFFF) {
+                    int stc = (m_fvf >> 8) & 0xF;
+                    int dtc = (fvf >> 8) & 0xF;
+                    int tc = stc < dtc ? stc : dtc;
+                    memcpy(dst + dTex0, src + sTex0, tc * 8);
+                }
+            }
+        }
+        if (m_ibData) memcpy(mesh->m_ibData, m_ibData, m_numFaces * 3 * sizeof(WORD));
+        *ppOut = mesh;
+        return S_OK;
+    }
+    // DrawSubset renders the mesh through the D3D device
+    // Implementation is below IDirect3DDevice8 (needs full device definition)
+    HRESULT DrawSubset(DWORD attr);
+};
+typedef ID3DXMesh* LPD3DXMESH;
+inline HRESULT D3DXCreateSphere(void* dev, float r, int slices, int stacks, LPD3DXMESH* m, void* adj) {
+    (void)adj;
+    // Generate actual sphere geometry (pos + normal + diffuse FVF)
+    int numVerts = (slices + 1) * (stacks + 1);
+    int numFaces = slices * stacks * 2;
+    // Default FVF: XYZ + NORMAL (24 bytes per vertex)
+    DWORD fvf = 0x002 | 0x010; // D3DFVF_XYZ | D3DFVF_NORMAL
+    ID3DXMesh* mesh = new ID3DXMesh();
+    mesh->Init(numFaces, numVerts, fvf, (IDirect3DDevice8*)dev);
+    // Fill vertex data: position(float3) + normal(float3)
+    float* vb = (float*)mesh->m_vbData;
+    for (int j = 0; j <= stacks; j++) {
+        float phi = 3.14159265f * (float)j / (float)stacks;
+        float sp = sinf(phi), cp = cosf(phi);
+        for (int i = 0; i <= slices; i++) {
+            float theta = 2.0f * 3.14159265f * (float)i / (float)slices;
+            float st2 = sinf(theta), ct = cosf(theta);
+            float nx = sp * ct, ny = cp, nz = sp * st2;
+            *vb++ = nx * r; *vb++ = ny * r; *vb++ = nz * r; // position
+            *vb++ = nx;     *vb++ = ny;     *vb++ = nz;     // normal
+        }
+    }
+    // Fill index data
+    WORD* ib = (WORD*)mesh->m_ibData;
+    for (int j = 0; j < stacks; j++) {
+        for (int i = 0; i < slices; i++) {
+            WORD v0 = (WORD)(j * (slices + 1) + i);
+            WORD v1 = v0 + 1;
+            WORD v2 = (WORD)((j + 1) * (slices + 1) + i);
+            WORD v3 = v2 + 1;
+            *ib++ = v0; *ib++ = v2; *ib++ = v1;
+            *ib++ = v1; *ib++ = v2; *ib++ = v3;
+        }
+    }
+    *m = mesh;
+    return S_OK;
+}
+inline HRESULT D3DXComputeNormals(LPD3DXMESH m, void* adj=NULL) { (void)m;(void)adj; return S_OK; }
+// D3DXComputeBoundingBox is defined later, after D3DXVECTOR3
+
+// FVF flags
+#define D3DFVF_XYZ           0x002
+#define D3DFVF_XYZRHW        0x004
+#define D3DFVF_NORMAL        0x010
+#define D3DFVF_NORMPACKED3   0x20000000  // Xbox-specific compressed normals
+#define D3DFVF_DIFFUSE       0x040
+#define D3DFVF_SPECULAR      0x080
+#define D3DFVF_TEX0          0x000
+#define D3DFVF_TEX1          0x100
+#define D3DFVF_TEX2          0x200
+#define D3DFVF_TEX3          0x300
+#define D3DFVF_TEX4          0x400
+
+// Vertex shader declaration tokens (Xbox D3D8)
+#define D3DVSD_STREAM(n) ((DWORD)(1 << 27) | ((n) << 0))
+#define D3DVSD_REG(reg, type) ((DWORD)((type) << 16) | (reg))
+#define D3DVSD_END() 0xFFFFFFFF
+#define D3DVSDT_FLOAT2      0x01
+#define D3DVSDT_FLOAT3      0x02
+#define D3DVSDT_FLOAT4      0x03
+#define D3DVSDT_NORMPACKED3 0x16
+#define D3DVSDT_D3DCOLOR    0x04
+#define D3DVSDE_POSITION    0
+#define D3DVSDE_NORMAL      3
+#define D3DVSDE_DIFFUSE     5
+#define D3DVSDE_TEXCOORD0   8
+
+// Lock flags
+#define D3DLOCK_DISCARD       0x2000
+#define D3DLOCK_READONLY      0x10
+#define D3DLOCK_NOOVERWRITE   0x1000
+#define D3DUSAGE_WRITEONLY    8
+#define D3DUSAGE_DYNAMIC      0x200
+
+// -------------------------------------------------------
+// D3D8 math types
+// -------------------------------------------------------
+struct D3DVECTOR { float x, y, z; };
+struct D3DMATRIX {
+    union {
+        float m[4][4];
+        struct { float _11,_12,_13,_14, _21,_22,_23,_24, _31,_32,_33,_34, _41,_42,_43,_44; };
+    };
+};
+
+struct D3DXVECTOR2 {
+    float x, y;
+    D3DXVECTOR2() : x(0), y(0) {}
+    D3DXVECTOR2(float _x, float _y) : x(_x), y(_y) {}
+};
+
+struct D3DXVECTOR3 : public D3DVECTOR {
+    D3DXVECTOR3() { x = y = z = 0; }
+    D3DXVECTOR3(float _x, float _y, float _z) { x = _x; y = _y; z = _z; }
+    D3DXVECTOR3(const D3DVECTOR& v) { x = v.x; y = v.y; z = v.z; }
+    D3DXVECTOR3 operator+(const D3DXVECTOR3& v) const { return D3DXVECTOR3(x+v.x, y+v.y, z+v.z); }
+    D3DXVECTOR3 operator-(const D3DXVECTOR3& v) const { return D3DXVECTOR3(x-v.x, y-v.y, z-v.z); }
+    D3DXVECTOR3 operator*(float s) const { return D3DXVECTOR3(x*s, y*s, z*s); }
+    D3DXVECTOR3& operator+=(const D3DXVECTOR3& v) { x+=v.x; y+=v.y; z+=v.z; return *this; }
+    D3DXVECTOR3& operator-=(const D3DXVECTOR3& v) { x-=v.x; y-=v.y; z-=v.z; return *this; }
+    D3DXVECTOR3& operator*=(float s) { x*=s; y*=s; z*=s; return *this; }
+    D3DXVECTOR3 operator-() const { return D3DXVECTOR3(-x,-y,-z); }
+};
+
+inline DWORD ComputeFVFStride(DWORD fvf) {
+    DWORD stride = 0;
+    if (fvf & D3DFVF_XYZ)    stride += 12;
+    if (fvf & D3DFVF_XYZRHW) stride += 16;
+    if (fvf & D3DFVF_NORMAL) stride += 12;
+    if (fvf & D3DFVF_NORMPACKED3) stride += 4;
+    if (fvf & D3DFVF_DIFFUSE)  stride += 4;
+    if (fvf & D3DFVF_SPECULAR) stride += 4;
+    DWORD texCount = (fvf >> 8) & 0xF;
+    stride += texCount * 8;
+    return stride;
+}
+
+inline HRESULT D3DXComputeBoundingBox(void* v, DWORD n, DWORD fvf, D3DXVECTOR3* mn, D3DXVECTOR3* mx) {
+    if (!v || n == 0) {
+        if (mn) { mn->x = mn->y = mn->z = 0; }
+        if (mx) { mx->x = mx->y = mx->z = 0; }
+        return S_OK;
+    }
+    DWORD stride = ComputeFVFStride(fvf);
+    if (stride == 0) stride = sizeof(float) * 3;
+    BYTE* p = (BYTE*)v;
+    float minX = ((float*)p)[0], minY = ((float*)p)[1], minZ = ((float*)p)[2];
+    float maxX = minX, maxY = minY, maxZ = minZ;
+    for (DWORD i = 1; i < n; i++) {
+        p += stride;
+        float px = ((float*)p)[0], py = ((float*)p)[1], pz = ((float*)p)[2];
+        if (px < minX) minX = px; if (px > maxX) maxX = px;
+        if (py < minY) minY = py; if (py > maxY) maxY = py;
+        if (pz < minZ) minZ = pz; if (pz > maxZ) maxZ = pz;
+    }
+    if (mn) { mn->x = minX; mn->y = minY; mn->z = minZ; }
+    if (mx) { mx->x = maxX; mx->y = maxY; mx->z = maxZ; }
+    return S_OK;
+}
+
+struct D3DXVECTOR4 {
+    float x, y, z, w;
+    D3DXVECTOR4() : x(0), y(0), z(0), w(0) {}
+    D3DXVECTOR4(float _x, float _y, float _z, float _w) : x(_x), y(_y), z(_z), w(_w) {}
+};
+
+struct D3DXQUATERNION {
+    float x, y, z, w;
+    D3DXQUATERNION() : x(0), y(0), z(0), w(1.0f) {}
+    D3DXQUATERNION(float _x, float _y, float _z, float _w) : x(_x), y(_y), z(_z), w(_w) {}
+};
+
+struct D3DXMATRIX : public D3DMATRIX {
+    D3DXMATRIX() { memset(this, 0, sizeof(*this)); }
+    D3DXMATRIX(const D3DMATRIX& o) { memcpy(this, &o, sizeof(D3DMATRIX)); }
+    D3DXMATRIX(float _11, float _12, float _13, float _14,
+               float _21, float _22, float _23, float _24,
+               float _31, float _32, float _33, float _34,
+               float _41, float _42, float _43, float _44) {
+        m[0][0]=_11; m[0][1]=_12; m[0][2]=_13; m[0][3]=_14;
+        m[1][0]=_21; m[1][1]=_22; m[1][2]=_23; m[1][3]=_24;
+        m[2][0]=_31; m[2][1]=_32; m[2][2]=_33; m[2][3]=_34;
+        m[3][0]=_41; m[3][1]=_42; m[3][2]=_43; m[3][3]=_44;
+    }
+    float& operator()(int r, int c) { return m[r][c]; }
+    float operator()(int r, int c) const { return m[r][c]; }
+    D3DXMATRIX operator*(const D3DXMATRIX& o) const {
+        D3DXMATRIX r;
+        for(int i=0;i<4;i++) for(int j=0;j<4;j++) {
+            r.m[i][j]=0; for(int k=0;k<4;k++) r.m[i][j]+=m[i][k]*o.m[k][j];
+        }
+        return r;
+    }
+};
+typedef D3DXMATRIX* LPD3DXMATRIX;
+
+// D3DX math functions (inline)
+inline D3DXMATRIX* D3DXMatrixIdentity(D3DXMATRIX* p) { memset(p,0,sizeof(*p)); p->m[0][0]=p->m[1][1]=p->m[2][2]=p->m[3][3]=1; return p; }
+inline D3DXMATRIX* D3DXMatrixTranslation(D3DXMATRIX* p, float x, float y, float z) { D3DXMatrixIdentity(p); p->m[3][0]=x; p->m[3][1]=y; p->m[3][2]=z; return p; }
+inline D3DXMATRIX* D3DXMatrixScaling(D3DXMATRIX* p, float sx, float sy, float sz) { memset(p,0,sizeof(*p)); p->m[0][0]=sx; p->m[1][1]=sy; p->m[2][2]=sz; p->m[3][3]=1; return p; }
+inline D3DXMATRIX* D3DXMatrixMultiply(D3DXMATRIX* o, const D3DXMATRIX* a, const D3DXMATRIX* b) { D3DXMATRIX t; for(int i=0;i<4;i++) for(int j=0;j<4;j++){t.m[i][j]=0;for(int k=0;k<4;k++)t.m[i][j]+=a->m[i][k]*b->m[k][j];} *o=t; return o; }
+inline D3DXMATRIX* D3DXMatrixRotationAxis(D3DXMATRIX* p, const D3DXVECTOR3* v, float a) {
+    float c=cosf(a),s=sinf(a),t=1-c,x=v->x,y=v->y,z=v->z;
+    float l=sqrtf(x*x+y*y+z*z); if(l>0){x/=l;y/=l;z/=l;}
+    D3DXMatrixIdentity(p);
+    p->m[0][0]=t*x*x+c;   p->m[0][1]=t*x*y+s*z; p->m[0][2]=t*x*z-s*y;
+    p->m[1][0]=t*x*y-s*z; p->m[1][1]=t*y*y+c;   p->m[1][2]=t*y*z+s*x;
+    p->m[2][0]=t*x*z+s*y; p->m[2][1]=t*y*z-s*x; p->m[2][2]=t*z*z+c;
+    return p;
+}
+inline D3DXMATRIX* D3DXMatrixLookAtLH(D3DXMATRIX* p, const D3DXVECTOR3* eye, const D3DXVECTOR3* at, const D3DXVECTOR3* up) {
+    D3DXVECTOR3 z = *at - *eye; float l=sqrtf(z.x*z.x+z.y*z.y+z.z*z.z); if(l>0){z.x/=l;z.y/=l;z.z/=l;}
+    D3DXVECTOR3 x; x.x=up->y*z.z-up->z*z.y; x.y=up->z*z.x-up->x*z.z; x.z=up->x*z.y-up->y*z.x;
+    l=sqrtf(x.x*x.x+x.y*x.y+x.z*x.z); if(l>0){x.x/=l;x.y/=l;x.z/=l;}
+    D3DXVECTOR3 y; y.x=z.y*x.z-z.z*x.y; y.y=z.z*x.x-z.x*x.z; y.z=z.x*x.y-z.y*x.x;
+    D3DXMatrixIdentity(p);
+    p->m[0][0]=x.x; p->m[0][1]=y.x; p->m[0][2]=z.x;
+    p->m[1][0]=x.y; p->m[1][1]=y.y; p->m[1][2]=z.y;
+    p->m[2][0]=x.z; p->m[2][1]=y.z; p->m[2][2]=z.z;
+    p->m[3][0]=-(x.x*eye->x+x.y*eye->y+x.z*eye->z);
+    p->m[3][1]=-(y.x*eye->x+y.y*eye->y+y.z*eye->z);
+    p->m[3][2]=-(z.x*eye->x+z.y*eye->y+z.z*eye->z);
+    return p;
+}
+inline D3DXMATRIX* D3DXMatrixPerspectiveFovLH(D3DXMATRIX* p, float fovy, float aspect, float zn, float zf) {
+    float ys=1.0f/tanf(fovy/2); memset(p,0,sizeof(*p));
+    p->m[0][0]=ys/aspect; p->m[1][1]=ys; p->m[2][2]=zf/(zf-zn); p->m[2][3]=1; p->m[3][2]=-zn*zf/(zf-zn); return p;
+}
+inline D3DXMATRIX* D3DXMatrixOrthoLH(D3DXMATRIX* p, float w, float h, float zn, float zf) {
+    memset(p,0,sizeof(*p)); p->m[0][0]=2/w; p->m[1][1]=2/h; p->m[2][2]=1/(zf-zn); p->m[3][2]=-zn/(zf-zn); p->m[3][3]=1; return p;
+}
+inline void D3DXMatrixRotationQuaternion(D3DXMATRIX* p, const D3DXQUATERNION* q) {
+    float xx=q->x*q->x,yy=q->y*q->y,zz=q->z*q->z,xy=q->x*q->y,xz=q->x*q->z,yz=q->y*q->z,wx=q->w*q->x,wy=q->w*q->y,wz=q->w*q->z;
+    D3DXMatrixIdentity(p);
+    p->m[0][0]=1-2*(yy+zz); p->m[0][1]=2*(xy+wz); p->m[0][2]=2*(xz-wy);
+    p->m[1][0]=2*(xy-wz); p->m[1][1]=1-2*(xx+zz); p->m[1][2]=2*(yz+wx);
+    p->m[2][0]=2*(xz+wy); p->m[2][1]=2*(yz-wx); p->m[2][2]=1-2*(xx+yy);
+}
+inline D3DXVECTOR3* D3DXVec3Normalize(D3DXVECTOR3* o, const D3DXVECTOR3* v) { float l=sqrtf(v->x*v->x+v->y*v->y+v->z*v->z); if(l>0){o->x=v->x/l;o->y=v->y/l;o->z=v->z/l;}else{o->x=o->y=o->z=0;} return o; }
+inline D3DXVECTOR3* D3DXVec3Cross(D3DXVECTOR3* o, const D3DXVECTOR3* a, const D3DXVECTOR3* b) { D3DXVECTOR3 t; t.x=a->y*b->z-a->z*b->y; t.y=a->z*b->x-a->x*b->z; t.z=a->x*b->y-a->y*b->x; *o=t; return o; }
+inline float D3DXVec3Dot(const D3DXVECTOR3* a, const D3DXVECTOR3* b) { return a->x*b->x+a->y*b->y+a->z*b->z; }
+inline float D3DXVec3Length(const D3DXVECTOR3* v) { return sqrtf(v->x*v->x+v->y*v->y+v->z*v->z); }
+inline D3DXVECTOR3* D3DXVec3Lerp(D3DXVECTOR3* o, const D3DXVECTOR3* a, const D3DXVECTOR3* b, float s) { o->x=a->x+s*(b->x-a->x); o->y=a->y+s*(b->y-a->y); o->z=a->z+s*(b->z-a->z); return o; }
+inline void D3DXVec3Scale(D3DXVECTOR3* out, const D3DXVECTOR3* v, float s) { out->x=v->x*s; out->y=v->y*s; out->z=v->z*s; }
+inline D3DXMATRIX* D3DXMatrixTranspose(D3DXMATRIX* o, const D3DXMATRIX* m) { D3DXMATRIX t; for(int i=0;i<4;i++) for(int j=0;j<4;j++) t.m[i][j]=m->m[j][i]; *o=t; return o; }
+inline D3DXVECTOR4* D3DXVec4Normalize(D3DXVECTOR4* o, const D3DXVECTOR4* v) { float l=sqrtf(v->x*v->x+v->y*v->y+v->z*v->z+v->w*v->w); if(l>0){o->x=v->x/l;o->y=v->y/l;o->z=v->z/l;o->w=v->w/l;}else{o->x=o->y=o->z=o->w=0;} return o; }
+inline void D3DXVec3TransformNormal(D3DXVECTOR3* out, const D3DXVECTOR3* v, const D3DXMATRIX* m) {
+    float x=v->x, y=v->y, z=v->z;
+    out->x = x*m->m[0][0] + y*m->m[1][0] + z*m->m[2][0];
+    out->y = x*m->m[0][1] + y*m->m[1][1] + z*m->m[2][1];
+    out->z = x*m->m[0][2] + y*m->m[1][2] + z*m->m[2][2];
+}
+inline D3DXMATRIX* D3DXMatrixInverse(D3DXMATRIX* out, float* pDet, const D3DXMATRIX* m) {
+    // Gauss-Jordan 4x4 matrix inversion
+    float tmp[4][8];
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) { tmp[i][j] = m->m[i][j]; tmp[i][j+4] = (i==j) ? 1.0f : 0.0f; }
+    }
+    for (int i = 0; i < 4; i++) {
+        int pivot = i;
+        for (int j = i+1; j < 4; j++) if (fabsf(tmp[j][i]) > fabsf(tmp[pivot][i])) pivot = j;
+        if (pivot != i) for (int k = 0; k < 8; k++) { float t = tmp[i][k]; tmp[i][k] = tmp[pivot][k]; tmp[pivot][k] = t; }
+        float d = tmp[i][i];
+        if (fabsf(d) < 1e-10f) { D3DXMatrixIdentity(out); return out; }
+        for (int k = 0; k < 8; k++) tmp[i][k] /= d;
+        for (int j = 0; j < 4; j++) {
+            if (j == i) continue;
+            float f = tmp[j][i];
+            for (int k = 0; k < 8; k++) tmp[j][k] -= f * tmp[i][k];
+        }
+    }
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) out->m[i][j] = tmp[i][j+4];
+    if (pDet) *pDet = 1.0f; // determinant not computed but non-zero if we got here
+    return out;
+}
+
+inline D3DXMATRIX* D3DXMatrixAffineTransformation(D3DXMATRIX* out, float s, const D3DXVECTOR3* c, const D3DXQUATERNION* r, const D3DXVECTOR3* t) {
+    D3DXMATRIX matR;
+    if (r) D3DXMatrixRotationQuaternion(&matR, r);
+    else D3DXMatrixIdentity(&matR);
+    D3DXMATRIX matS;
+    D3DXMatrixScaling(&matS, s, s, s);
+    D3DXMATRIX result;
+    D3DXMatrixMultiply(&result, &matS, &matR);
+    if (c) {
+        result.m[3][0] += -c->x * result.m[0][0] - c->y * result.m[1][0] - c->z * result.m[2][0] + c->x;
+        result.m[3][1] += -c->x * result.m[0][1] - c->y * result.m[1][1] - c->z * result.m[2][1] + c->y;
+        result.m[3][2] += -c->x * result.m[0][2] - c->y * result.m[1][2] - c->z * result.m[2][2] + c->z;
+    }
+    if (t) { result.m[3][0] += t->x; result.m[3][1] += t->y; result.m[3][2] += t->z; }
+    *out = result;
+    return out;
+}
+
+inline D3DXQUATERNION* D3DXQuaternionIdentity(D3DXQUATERNION* o) { o->x=o->y=o->z=0; o->w=1; return o; }
+inline D3DXQUATERNION* D3DXQuaternionRotationAxis(D3DXQUATERNION* o, const D3DXVECTOR3* v, float a) {
+    float l=sqrtf(v->x*v->x+v->y*v->y+v->z*v->z),s=sinf(a/2);
+    if(l>0){o->x=v->x/l*s;o->y=v->y/l*s;o->z=v->z/l*s;}else{o->x=o->y=o->z=0;} o->w=cosf(a/2); return o;
+}
+inline D3DXQUATERNION* D3DXQuaternionSlerp(D3DXQUATERNION* o, const D3DXQUATERNION* a, const D3DXQUATERNION* b, float t) {
+    float d=a->x*b->x+a->y*b->y+a->z*b->z+a->w*b->w; D3DXQUATERNION q=*b;
+    if(d<0){d=-d;q.x=-q.x;q.y=-q.y;q.z=-q.z;q.w=-q.w;}
+    if(d>0.9995f){o->x=a->x+t*(q.x-a->x);o->y=a->y+t*(q.y-a->y);o->z=a->z+t*(q.z-a->z);o->w=a->w+t*(q.w-a->w);}
+    else{float th=acosf(d),s1=sinf((1-t)*th)/sinf(th),s2=sinf(t*th)/sinf(th);o->x=s1*a->x+s2*q.x;o->y=s1*a->y+s2*q.y;o->z=s1*a->z+s2*q.z;o->w=s1*a->w+s2*q.w;}
+    return o;
+}
+inline D3DXQUATERNION* D3DXQuaternionMultiply(D3DXQUATERNION* o, const D3DXQUATERNION* a, const D3DXQUATERNION* b) {
+    D3DXQUATERNION t;
+    t.w=a->w*b->w-a->x*b->x-a->y*b->y-a->z*b->z;
+    t.x=a->w*b->x+a->x*b->w+a->y*b->z-a->z*b->y;
+    t.y=a->w*b->y-a->x*b->z+a->y*b->w+a->z*b->x;
+    t.z=a->w*b->z+a->x*b->y-a->y*b->x+a->z*b->w;
+    *o=t; return o;
+}
+
+inline D3DXQUATERNION* D3DXQuaternionRotationYawPitchRoll(D3DXQUATERNION* o, float yaw, float pitch, float roll) {
+    float cy=cosf(yaw/2),sy=sinf(yaw/2),cp=cosf(pitch/2),sp=sinf(pitch/2),cr=cosf(roll/2),sr=sinf(roll/2);
+    o->w=cy*cp*cr+sy*sp*sr; o->x=cy*sp*cr+sy*cp*sr; o->y=sy*cp*cr-cy*sp*sr; o->z=cy*cp*sr-sy*sp*cr; return o;
+}
+inline D3DXQUATERNION* D3DXQuaternionRotationMatrix(D3DXQUATERNION* o, const D3DXMATRIX* m) {
+    float tr=m->m[0][0]+m->m[1][1]+m->m[2][2];
+    if(tr>0){float s=0.5f/sqrtf(tr+1);o->w=0.25f/s;o->x=(m->m[2][1]-m->m[1][2])*s;o->y=(m->m[0][2]-m->m[2][0])*s;o->z=(m->m[1][0]-m->m[0][1])*s;}
+    else if(m->m[0][0]>m->m[1][1]&&m->m[0][0]>m->m[2][2]){float s=2*sqrtf(1+m->m[0][0]-m->m[1][1]-m->m[2][2]);o->w=(m->m[2][1]-m->m[1][2])/s;o->x=0.25f*s;o->y=(m->m[0][1]+m->m[1][0])/s;o->z=(m->m[0][2]+m->m[2][0])/s;}
+    else if(m->m[1][1]>m->m[2][2]){float s=2*sqrtf(1+m->m[1][1]-m->m[0][0]-m->m[2][2]);o->w=(m->m[0][2]-m->m[2][0])/s;o->x=(m->m[0][1]+m->m[1][0])/s;o->y=0.25f*s;o->z=(m->m[1][2]+m->m[2][1])/s;}
+    else{float s=2*sqrtf(1+m->m[2][2]-m->m[0][0]-m->m[1][1]);o->w=(m->m[1][0]-m->m[0][1])/s;o->x=(m->m[0][2]+m->m[2][0])/s;o->y=(m->m[1][2]+m->m[2][1])/s;o->z=0.25f*s;}
+    return o;
+}
+inline D3DXVECTOR3* D3DXVec3CatmullRom(D3DXVECTOR3* o, const D3DXVECTOR3* p0, const D3DXVECTOR3* p1, const D3DXVECTOR3* p2, const D3DXVECTOR3* p3, float s) {
+    float s2=s*s, s3=s2*s;
+    o->x=0.5f*(2*p1->x+(-p0->x+p2->x)*s+(2*p0->x-5*p1->x+4*p2->x-p3->x)*s2+(-p0->x+3*p1->x-3*p2->x+p3->x)*s3);
+    o->y=0.5f*(2*p1->y+(-p0->y+p2->y)*s+(2*p0->y-5*p1->y+4*p2->y-p3->y)*s2+(-p0->y+3*p1->y-3*p2->y+p3->y)*s3);
+    o->z=0.5f*(2*p1->z+(-p0->z+p2->z)*s+(2*p0->z-5*p1->z+4*p2->z-p3->z)*s2+(-p0->z+3*p1->z-3*p2->z+p3->z)*s3);
+    return o;
+}
+
+#ifndef D3DX_PI
+#define D3DX_PI 3.141592654f
+#endif
+
+// -------------------------------------------------------
+// D3D8 structures
+// -------------------------------------------------------
+typedef struct { float r, g, b, a; } D3DCOLORVALUE;
+typedef struct { LONG x1, y1, x2, y2; } D3DRECT;
+typedef struct { D3DCOLORVALUE Diffuse, Specular, Ambient, Emissive; float Power; } D3DMATERIAL8;
+typedef struct { DWORD Type; D3DCOLORVALUE Diffuse, Specular, Ambient; D3DVECTOR Direction, Position; float Range, Falloff, Attenuation0, Attenuation1, Attenuation2, Theta, Phi; } D3DLIGHT8;
+#define D3DLIGHT_DIRECTIONAL 3
+#define D3DLIGHT_SPOT 2
+#define D3DLIGHT_POINT 1
+typedef struct { UINT Width, Height; D3DFORMAT Format; } D3DSURFACE_DESC;
+typedef struct { int Pitch; void* pBits; } D3DLOCKED_RECT;
+
+typedef struct {
+    UINT BackBufferWidth, BackBufferHeight;
+    D3DFORMAT BackBufferFormat;
+    UINT BackBufferCount;
+    DWORD MultiSampleType;
+    DWORD SwapEffect;
+    void* hDeviceWindow;
+    BOOL Windowed;
+    BOOL EnableAutoDepthStencil;
+    D3DFORMAT AutoDepthStencilFormat;
+    DWORD Flags;
+    UINT FullScreen_RefreshRateInHz;
+    UINT FullScreen_PresentationInterval;
+} D3DPRESENT_PARAMETERS;
+// -------------------------------------------------------
+// SDL window + leftover GL-typed state from the old GL backend.
+// -------------------------------------------------------
+extern SDL_Window* g_pSDLWindow;
+extern SDL_GLContext g_pGLContext;
+
+// Inert under bgfx (g_gl is unused); kept only because ExpandIndices still
+// leans on the GLuint / GLint typedefs it holds.
+struct GLState {
+    GLuint program;
+    GLuint vao;
+    GLuint dynamicVBO;  // for DrawPrimitiveUP / DrawIndexedPrimitiveUP
+    GLuint dynamicIBO;
+    GLuint whiteTex;    // 1x1 white texture (used when no texture bound)
+    // Uniform locations
+    GLint u_WVP, u_WorldView;
+    GLint u_FalloffFront, u_FalloffDelta;
+    GLint u_NormalInv;      // WV^-1 matrix for normal transform (from c5-c8)
+    GLint u_TFactor, u_MatDiffuse;
+    GLint u_VertexMode;     // 0=3D, 1=RHW (pre-transformed)
+    GLint u_ColorSource;    // 0=falloff, 1=diffuse_attr, 2=tfactor, 3=white, 4=mat_diffuse
+    GLint u_AlphaSource;    // 0=from_color, 1=tfactor, 2=diffuse_attr, 3=opaque
+    GLint u_AlphaMul;       // stage 1 multiplier
+    GLint u_VertexAlphaMul; // 1 = also multiply final alpha by vertex diffuse alpha (text.cpp soft-fade clip)
+    GLint u_NormalType;     // 0=none, 1=float3, 2=packed(uint)
+    GLint u_Tex0, u_Tex1;
+    GLint u_FragColorOp;    // 0=v_Color, 1=texture, 2=v_Color×texture
+    GLint u_FragAlphaOp;    // 0=v_Color.a, 1=tex.a, 2=v_Color.a×tex.a
+    GLint u_HasTex1;        // stage 1 texture bound
+    GLint u_Tex1AlphaOp;    // 0=none, 1=multiply alpha by tex1.a
+    GLint u_Tex1ColorOp;    // 0=none, 1=add tex1.rgb to color
+    GLint u_EnvMapMode;     // 0=off, 1=spherical env map (reflection material)
+    GLint u_ViewportSize;   // vec2(backbuffer width, backbuffer height) for XYZRHW
+    GLint u_AlphaRef;       // alpha test threshold (0=disabled)
+    // Attribute locations
+    GLint a_Position, a_Normal, a_PackedNrm, a_Diffuse, a_TexCoord;
+};
+extern GLState g_gl;
+
+// ---------------------------------------------------------------------------
+// CRT Post-Process Effect
+// ---------------------------------------------------------------------------
+struct CRTState {
+    bool     enabled;          // master toggle (F4)
+    bool     settingsOpen;     // F4 settings panel visible
+    // Effect parameters
+    float    scanlineIntensity; // 0=off, 1=full black lines
+    float    curvature;         // barrel distortion amount
+    float    phosphorMask;      // RGB sub-pixel intensity
+    float    vignette;          // corner darkening
+    float    bloom;             // glow/bleed amount
+    float    flickerAmount;     // subtle brightness variation
+    float    colorBleed;        // horizontal color smear
+    float    brightness;        // overall brightness adjustment
+    // bgfx resources. Offscreen target gets allocated lazily on the first
+    // frame CRT is on; freed when the window resizes.
+    bgfx::FrameBufferHandle fb;
+    bgfx::TextureHandle     colorTex; // attachment we sample in the blit
+    bgfx::ProgramHandle     program;  // vs_blit + fs_crt
+    bgfx::UniformHandle     s_scene;  // sampler for the offscreen color tex
+    bgfx::UniformHandle     u_p1;     // scanline / curvature / phosphor / vignette
+    bgfx::UniformHandle     u_p2;     // bloom / flicker / colorBleed / brightness
+    bgfx::UniformHandle     u_p3;     // time / resolution.x / resolution.y / unused
+    int      texW, texH;       // current FBO dimensions
+};
+extern CRTState g_crt;
+
+
+// Forward decl matching the loader in sdl_main.cpp. Takes a stem like
+// "vs_blit"; resolves the per-renderer subdir + .bin extension.
+bgfx::ShaderHandle theseus_bgfx_load_shader(const char* name);
+
+// Allocates the offscreen framebuffer + color attachment + program +
+// uniforms. Called once on startup. CRT toggle just gates whether we
+// actually route view 0 through this FB at frame time.
+inline bool InitCRTShader_Bgfx(int /*width*/, int /*height*/) {
+    bgfx::ShaderHandle vs = theseus_bgfx_load_shader("vs_blit");
+    bgfx::ShaderHandle fs = theseus_bgfx_load_shader("fs_crt");
+    if (!bgfx::isValid(vs) || !bgfx::isValid(fs)) {
+        fprintf(stderr, "[CRT] bgfx shader load failed\n");
+        return false;
+    }
+    g_crt.program = bgfx::createProgram(vs, fs, true);
+
+    g_crt.s_scene = bgfx::createUniform("s_crtScene",  bgfx::UniformType::Sampler);
+    g_crt.u_p1    = bgfx::createUniform("u_CrtParams1", bgfx::UniformType::Vec4);
+    g_crt.u_p2    = bgfx::createUniform("u_CrtParams2", bgfx::UniformType::Vec4);
+    g_crt.u_p3    = bgfx::createUniform("u_CrtParams3", bgfx::UniformType::Vec4);
+
+    g_crt.colorTex.idx = bgfx::kInvalidHandle;
+    g_crt.fb.idx       = bgfx::kInvalidHandle;
+    g_crt.texW = 0;
+    g_crt.texH = 0;
+    return true;
+}
+
+// (Re)allocate the offscreen framebuffer at the requested pixel size.
+// bgfx framebuffers are immutable; resize = destroy + create.
+inline void CRT_ResizeFBO_Bgfx(int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    if (width == g_crt.texW && height == g_crt.texH && bgfx::isValid(g_crt.fb)) return;
+    if (bgfx::isValid(g_crt.fb))       bgfx::destroy(g_crt.fb);
+    if (bgfx::isValid(g_crt.colorTex)) bgfx::destroy(g_crt.colorTex);
+
+    const uint64_t sampleFlags = BGFX_TEXTURE_RT
+                               | BGFX_SAMPLER_U_CLAMP
+                               | BGFX_SAMPLER_V_CLAMP;
+    g_crt.colorTex = bgfx::createTexture2D(
+        (uint16_t)width, (uint16_t)height, false, 1,
+        bgfx::TextureFormat::BGRA8, sampleFlags);
+
+    bgfx::TextureHandle attachments[1] = { g_crt.colorTex };
+    g_crt.fb = bgfx::createFrameBuffer(1, attachments, false);
+    g_crt.texW = width;
+    g_crt.texH = height;
+}
+
+// Point view 0 at the offscreen FB before the scene draws. Must be
+// matched by exactly one CRT_EndAndBlit_Bgfx submit per frame; do not
+// reset view 0's framebuffer in between, because bgfx applies the most
+// recent setViewFrameBuffer call to *all* submits on that view in the
+// frame (so resetting after submits would draw the scene to the
+// backbuffer instead of into the FBO).
+inline void CRT_BeginCapture_Bgfx() {
+    bgfx::setViewFrameBuffer(0, g_crt.fb);
+}
+
+// Called every frame, regardless of toggle state, so view 0 binds to the
+// backbuffer once CRT goes off again (the previous frame may have left
+// it pointing at the offscreen FB).
+inline void CRT_PointViewToBackbuffer_Bgfx() {
+    bgfx::setViewFrameBuffer(0, BGFX_INVALID_HANDLE);
+}
+
+// Submit the fullscreen blit into view 1 (which targets the backbuffer)
+// with the CRT shader sampling view 0's color attachment.
+inline void CRT_EndAndBlit_Bgfx(float time, int width, int height) {
+    // View 1 = post-process pass to backbuffer.
+    bgfx::setViewFrameBuffer(1, BGFX_INVALID_HANDLE);
+    bgfx::setViewRect(1, 0, 0, (uint16_t)width, (uint16_t)height);
+    bgfx::setViewClear(1, 0); // backbuffer is fully overwritten by the quad
+
+    // Same fullscreen quad as boot_anim's blit. Layout has to match vs_blit's
+    // declared $input slots.
+    bgfx::VertexLayout layout;
+    layout.begin()
+        .add(bgfx::Attrib::Position,  3, bgfx::AttribType::Float)
+        .add(bgfx::Attrib::Normal,    3, bgfx::AttribType::Float)
+        .add(bgfx::Attrib::Color0,    4, bgfx::AttribType::Uint8, true)
+        .add(bgfx::Attrib::Color1,    4, bgfx::AttribType::Uint8, true)
+        .add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float)
+        .end();
+
+    // UV layout matches boot_anim's blit: bottom of the quad samples V=1,
+    // top samples V=0. The offscreen FB written by view 0 follows the
+    // active backend's render-target origin, so the top-of-screen pixel
+    // sits at the top of the texture. Without this mapping the post-
+    // process samples the FBO upside-down, which on Metal manifests as
+    // the dashboard rendering rotated 180.
+    struct V { float px, py, pz, nx, ny, nz; uint32_t c0, c1; float u, v; };
+    V verts[4] = {
+        { -1.f, -1.f, 0.f, 0,0,0, 0,0, 0.f, 1.f },
+        {  1.f, -1.f, 0.f, 0,0,0, 0,0, 1.f, 1.f },
+        {  1.f,  1.f, 0.f, 0,0,0, 0,0, 1.f, 0.f },
+        { -1.f,  1.f, 0.f, 0,0,0, 0,0, 0.f, 0.f },
+    };
+    const uint16_t idx[6] = { 0, 1, 2, 0, 2, 3 };
+
+    bgfx::TransientVertexBuffer tvb;
+    bgfx::TransientIndexBuffer  tib;
+    if (bgfx::getAvailTransientVertexBuffer(4, layout) < 4) return;
+    if (bgfx::getAvailTransientIndexBuffer(6) < 6)            return;
+    bgfx::allocTransientVertexBuffer(&tvb, 4, layout);
+    memcpy(tvb.data, verts, sizeof(verts));
+    bgfx::allocTransientIndexBuffer(&tib, 6);
+    memcpy(tib.data, idx, sizeof(idx));
+
+    float p1[4] = { g_crt.scanlineIntensity, g_crt.curvature, g_crt.phosphorMask, g_crt.vignette };
+    float p2[4] = { g_crt.bloom, g_crt.flickerAmount, g_crt.colorBleed, g_crt.brightness };
+    float p3[4] = { time, (float)g_crt.texW, (float)g_crt.texH, 0.0f };
+    bgfx::setUniform(g_crt.u_p1, p1);
+    bgfx::setUniform(g_crt.u_p2, p2);
+    bgfx::setUniform(g_crt.u_p3, p3);
+
+    bgfx::setTexture(0, g_crt.s_scene, g_crt.colorTex);
+    bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A);
+    bgfx::setVertexBuffer(0, &tvb, 0, 4);
+    bgfx::setIndexBuffer(&tib, 0, 6);
+    bgfx::submit(1, g_crt.program);
+}
+
+// -------------------------------------------------------
+// D3D8 interface stubs backed by bgfx
+// -------------------------------------------------------
+
+class IDirect3DTexture8 {
+    int m_ref;
+public:
+    GLuint m_glTexture;
+    UINT m_width, m_height;
+    BYTE* m_pixels;      // RGBA pixel data (for LockRect)
+    int m_pitch;
+    char m_srcName[128]; // Source filename for inspector
+    // The actual GPU texture, created lazily from m_pixels.
+    bgfx::TextureHandle m_bgfxTex;
+    bool m_bgfxDirty;
+
+    // Instance list for recreating textures on device reset.
+    IDirect3DTexture8* m_nextTex;
+    static IDirect3DTexture8* s_firstTex;
+
+    IDirect3DTexture8() : m_ref(1), m_glTexture(0), m_width(0), m_height(0), m_pixels(NULL), m_pitch(0) {
+        m_srcName[0] = 0;
+        m_bgfxTex   = BGFX_INVALID_HANDLE;
+        m_bgfxDirty = true;
+        m_nextTex = s_firstTex; s_firstTex = this;
+    }
+    ~IDirect3DTexture8() {
+        if (bgfx::isValid(m_bgfxTex)) bgfx::destroy(m_bgfxTex);
+        free(m_pixels);
+        // Remove from linked list
+        IDirect3DTexture8** pp = &s_firstTex;
+        while (*pp && *pp != this) pp = &(*pp)->m_nextTex;
+        if (*pp) *pp = m_nextTex;
+    }
+    ULONG AddRef() { return ++m_ref; }
+    ULONG Release() { if(--m_ref <= 0) { delete this; return 0; } return m_ref; }
+    HRESULT GetLevelDesc(UINT level, D3DSURFACE_DESC* desc) {
+        desc->Width = m_width ? m_width : 1;
+        desc->Height = m_height ? m_height : 1;
+        desc->Format = D3DFMT_A8R8G8B8;
+        return S_OK;
+    }
+    HRESULT LockRect(UINT level, D3DLOCKED_RECT* lr, const void* rect, DWORD flags) {
+        if (!m_pixels && m_width > 0 && m_height > 0) {
+            m_pitch = m_width * 4;
+            m_pixels = (BYTE*)calloc(m_width * m_height, 4);
+        }
+        if (m_pixels) { lr->Pitch = m_pitch; lr->pBits = m_pixels; }
+        else { static char dummy[4]={}; lr->Pitch=4; lr->pBits=dummy; }
+        m_bgfxDirty = true;
+        return S_OK;
+    }
+    HRESULT UnlockRect(UINT level) {
+        return S_OK;
+    }
+
+    // Create from RGBA. bgfx upload is lazy via BgfxEnsureTextureUploaded.
+    bool CreateFromRGBA(UINT w, UINT h, const BYTE* rgba) {
+        if (!rgba || w == 0 || h == 0) return false;
+        m_width = w; m_height = h; m_pitch = w * 4;
+        m_pixels = (BYTE*)malloc(w * h * 4);
+        if (!m_pixels) return false;
+        memcpy(m_pixels, rgba, w * h * 4);
+        m_bgfxDirty = true;
+        return true;
+    }
+};
+typedef IDirect3DTexture8* LPDIRECT3DTEXTURE8;
+
+class IDirect3DVertexBuffer8 {
+    int m_ref; UINT m_size;
+public:
+    void* m_data;
+    GLuint m_glBuffer;
+    bool m_glDirty;
+    // bgfx VB handle. Layout depends on FVF, so it's built on first draw.
+    bgfx::DynamicVertexBufferHandle m_bgfxVB;
+    bool m_bgfxDirty;
+    IDirect3DVertexBuffer8* m_nextVB;
+    static IDirect3DVertexBuffer8* s_firstVB;
+
+    IDirect3DVertexBuffer8(UINT size) : m_ref(1), m_size(size), m_glBuffer(0), m_glDirty(true) {
+        m_data = calloc(1, size ? size : 1);
+        m_bgfxVB    = BGFX_INVALID_HANDLE;
+        m_bgfxDirty = true;
+        // Defer glGenBuffers to EnsureUploaded, constructor may run on non-GL thread
+        m_nextVB = s_firstVB; s_firstVB = this;
+    }
+    ~IDirect3DVertexBuffer8() {
+        free(m_data);
+        if (bgfx::isValid(m_bgfxVB)) bgfx::destroy(m_bgfxVB);
+        IDirect3DVertexBuffer8** pp = &s_firstVB;
+        while (*pp && *pp != this) pp = &(*pp)->m_nextVB;
+        if (*pp) *pp = m_nextVB;
+    }
+    ULONG AddRef() { return ++m_ref; }
+    ULONG Release() { if(--m_ref <= 0) { delete this; return 0; } return m_ref; }
+    HRESULT Lock(UINT off, UINT size, BYTE** ppData, DWORD flags) {
+        *ppData = (BYTE*)m_data + off;
+        m_glDirty = true;
+        m_bgfxDirty = true;
+        return S_OK;
+    }
+    HRESULT Unlock() { return S_OK; }
+    UINT GetSize() const { return m_size; }
+
+    void EnsureUploaded() {
+    }
+};
+typedef IDirect3DVertexBuffer8* LPDIRECT3DVERTEXBUFFER8;
+
+class IDirect3DIndexBuffer8 {
+    int m_ref; UINT m_size;
+public:
+    void* m_data;
+    GLuint m_glBuffer;
+    bool m_glDirty;
+    bgfx::DynamicIndexBufferHandle m_bgfxIB;
+    bool m_bgfxDirty;
+    IDirect3DIndexBuffer8* m_nextIB;
+    static IDirect3DIndexBuffer8* s_firstIB;
+
+    IDirect3DIndexBuffer8(UINT size) : m_ref(1), m_size(size), m_glBuffer(0), m_glDirty(true) {
+        m_data = malloc(size);
+        m_bgfxIB    = BGFX_INVALID_HANDLE;
+        m_bgfxDirty = true;
+        // Defer glGenBuffers to EnsureUploaded, constructor may run on non-GL thread
+        m_nextIB = s_firstIB; s_firstIB = this;
+    }
+    ~IDirect3DIndexBuffer8() {
+        free(m_data);
+        if (bgfx::isValid(m_bgfxIB)) bgfx::destroy(m_bgfxIB);
+        IDirect3DIndexBuffer8** pp = &s_firstIB;
+        while (*pp && *pp != this) pp = &(*pp)->m_nextIB;
+        if (*pp) *pp = m_nextIB;
+    }
+    ULONG AddRef() { return ++m_ref; }
+    ULONG Release() { if(--m_ref <= 0) { delete this; return 0; } return m_ref; }
+    HRESULT Lock(UINT off, UINT size, BYTE** ppData, DWORD flags) {
+        *ppData = (BYTE*)m_data + off;
+        m_glDirty = true;
+        m_bgfxDirty = true;
+        return S_OK;
+    }
+    HRESULT Unlock() { return S_OK; }
+    UINT GetSize() const { return m_size; }
+
+    void EnsureUploaded() {
+    }
+};
+typedef IDirect3DIndexBuffer8* LPDIRECT3DINDEXBUFFER8;
+
+// Re-upload all GL resources after context recreation (MSAA change, etc.)
+
+// Deferred implementations for ID3DXMesh (needs buffer classes to be defined)
+inline HRESULT ID3DXMesh::GetVertexBuffer(IDirect3DVertexBuffer8** ppVB) {
+    if (!m_vbData || m_numVerts == 0) { *ppVB = NULL; return E_FAIL; }
+    UINT size = m_numVerts * m_vertStride;
+    IDirect3DVertexBuffer8* vb = new IDirect3DVertexBuffer8(size);
+    memcpy(vb->m_data, m_vbData, size);
+    vb->m_glDirty = true;
+    *ppVB = vb;
+    return S_OK;
+}
+inline HRESULT ID3DXMesh::GetIndexBuffer(IDirect3DIndexBuffer8** ppIB) {
+    if (!m_ibData || m_numFaces == 0) { *ppIB = NULL; return E_FAIL; }
+    UINT size = m_numFaces * 3 * sizeof(WORD);
+    IDirect3DIndexBuffer8* ib = new IDirect3DIndexBuffer8(size);
+    memcpy(ib->m_data, m_ibData, size);
+    ib->m_glDirty = true;
+    *ppIB = ib;
+    return S_OK;
+}
+
+class IDirect3DSurface8 {
+    int m_ref;
+public:
+    IDirect3DSurface8() : m_ref(1) {}
+    ULONG AddRef() { return ++m_ref; }
+    ULONG Release() { if(--m_ref <= 0) { delete this; return 0; } return m_ref; }
+    HRESULT GetDesc(D3DSURFACE_DESC* desc) { desc->Width=640; desc->Height=480; desc->Format=D3DFMT_A8R8G8B8; return S_OK; }
+    HRESULT LockRect(D3DLOCKED_RECT* lr, const void* rect, DWORD flags) { static char dummy[4]={0}; lr->Pitch=4; lr->pBits=dummy; return S_OK; }
+    HRESULT UnlockRect() { return S_OK; }
+};
+typedef IDirect3DSurface8* LPDIRECT3DSURFACE8;
+
+class IDirect3DDevice8 {
+public:
+    int m_ref;
+    DWORD m_fvf;
+    IDirect3DTexture8* m_textures[4];
+    D3DXMATRIX m_matWorld, m_matView, m_matProj;
+    D3DXMATRIX m_matWVP; // cached world*view*proj
+    D3DXMATRIX m_matWV;  // cached world*view (for falloff normals)
+    bool m_wvpDirty;
+    D3DCOLOR m_matDiffuse;
+    D3DCOLOR m_texFactor;
+    float m_falloffFront[4]; // c15
+    float m_falloffDelta[4]; // c16
+    float m_normalInv[16];   // c5-c8: WV^-1 for normal transform
+    bool m_alphaTestEnabled = false;
+    float m_alphaRef = 0.0f;
+    // TheseusSetVertexAlphaMul gates the shader's per-vertex alpha
+    // multiply path. Used by text VerticalFade to clip text against a
+    // fade gradient. State is stage-0 only.
+    bool m_vertexAlphaMul = false;
+    bool m_envMapMode;       // true when reflection shader sets c48
+    bool m_effectShaderActive;
+    bool m_alphaBlendEnable;
+    DWORD m_srcBlend, m_destBlend;
+    bool m_zEnable;
+    bool m_zWriteEnable;
+    DWORD m_zFunc;
+    DWORD m_cullMode;
+    DWORD m_fillMode;
+    bool m_lighting;
+    bool m_colorVertex;
+    // Parallel BGFX_STATE_* bitmask mirroring the D3DRS_* writes above,
+    // passed to bgfx::setState at draw time.
+    uint64_t m_bgfxState;
+public:
+    const char* m_dbgMatName; // debug: last material name
+
+    // ---- Node Inspector ----
+    struct DrawRecord {
+        const char* matName;
+        char tex0Name[128];
+        UINT tex0W, tex0H;
+        char tex1Name[128];
+        float screenMinX, screenMinY, screenMaxX, screenMaxY;
+        void* sceneNode; // CNode* that issued this draw call
+    };
+    static const int MAX_DRAW_RECORDS = 2048;
+    DrawRecord m_drawRecords[MAX_DRAW_RECORDS];
+    int m_drawRecordCount;
+    int m_inspectorHitID;           // last hovered draw record (-1 = none)
+    char m_inspectorText[512];      // formatted tooltip text
+    int m_mouseX, m_mouseY;         // current mouse position
+    bool m_inspectorEnabled;        // toggle with F1
+    void* m_inspectorCurrentNode;   // CNode* currently being rendered
+    void* m_inspectorSelectedNode;  // CNode* selected in tree or 3D view
+
+    void InspectorBeginFrame() { m_drawRecordCount = 0; }
+    const char* InspectorGetText() { return (m_inspectorHitID >= 0) ? m_inspectorText : NULL; }
+
+private:
+    // TSS tracking
+    DWORD m_tss0ColorOp, m_tss0ColorArg1, m_tss0ColorArg2;
+    DWORD m_tss0AlphaOp, m_tss0AlphaArg1, m_tss0AlphaArg2;
+    DWORD m_tss1ColorOp, m_tss1ColorArg1, m_tss1ColorArg2;
+    DWORD m_tss1AlphaOp, m_tss1AlphaArg1, m_tss1AlphaArg2;
+    // Stage-0 sampler state. bgfx wants flags baked into setTexture per draw.
+    DWORD m_tss0AddressU, m_tss0AddressV;
+    DWORD m_tss0MinFilter, m_tss0MagFilter;
+
+    void UpdateWVP() {
+        if (m_wvpDirty) {
+            m_matWV = m_matWorld * m_matView;
+            m_matWVP = m_matWV * m_matProj;
+            m_wvpDirty = false;
+        }
+    }
+
+public:
+    IDirect3DDevice8() : m_ref(1), m_fvf(0), m_streamVB(NULL), m_streamIB(NULL), m_streamStride(0), m_baseVertex(0), m_wvpDirty(true), m_matDiffuse(0xFFFFFFFF), m_texFactor(0xFFFFFFFF), m_falloffFront{1,1,1,1}, m_falloffDelta{0,0,0,0}, m_normalInv{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}, m_envMapMode(false),
+        m_effectShaderActive(false),
+        m_alphaBlendEnable(false), m_srcBlend(0xFFFFFFFF), m_destBlend(0xFFFFFFFF),
+        m_zEnable(false), m_zWriteEnable(true), m_zFunc(0xFFFFFFFF), m_cullMode(D3DCULL_NONE), m_fillMode(0xFFFFFFFF), m_lighting(false), m_colorVertex(false),
+        m_dbgMatName("(none)"), m_drawRecordCount(0), m_inspectorHitID(-1), m_mouseX(0), m_mouseY(0), m_inspectorEnabled(false), m_inspectorCurrentNode(NULL), m_inspectorSelectedNode(NULL), m_frameDrawCalls(0), m_frameNumber(0),
+        m_tss0ColorOp(D3DTOP_DISABLE), m_tss0ColorArg1(D3DTA_TEXTURE), m_tss0ColorArg2(D3DTA_CURRENT),
+        m_tss0AlphaOp(D3DTOP_DISABLE), m_tss0AlphaArg1(D3DTA_TEXTURE), m_tss0AlphaArg2(D3DTA_CURRENT),
+        m_tss1ColorOp(D3DTOP_DISABLE), m_tss1ColorArg1(D3DTA_TEXTURE), m_tss1ColorArg2(D3DTA_CURRENT),
+        m_tss1AlphaOp(D3DTOP_DISABLE), m_tss1AlphaArg1(D3DTA_TEXTURE), m_tss1AlphaArg2(D3DTA_CURRENT)
+        , m_tss0AddressU(D3DTADDRESS_WRAP), m_tss0AddressV(D3DTADDRESS_WRAP)
+        , m_tss0MinFilter(D3DTEXF_LINEAR), m_tss0MagFilter(D3DTEXF_LINEAR)
+    {
+        memset(m_textures, 0, sizeof(m_textures));
+        D3DXMatrixIdentity(&m_matWorld); D3DXMatrixIdentity(&m_matView); D3DXMatrixIdentity(&m_matProj);
+        D3DXMatrixIdentity(&m_matWVP); D3DXMatrixIdentity(&m_matWV);
+        // Match GL boot state: blend off, depth-test off, depth-write on, no cull.
+        // bgfx default front winding is CW which matches D3D; don't add FRONT_CCW.
+        m_bgfxState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                    | BGFX_STATE_WRITE_Z;
+    }
+    ULONG AddRef() { return ++m_ref; }
+    ULONG Release() { if(--m_ref <= 0) { delete this; return 0; } return m_ref; }
+
+    // ---- Inspector: record draw call with screen AABB ----
+    void InspectorRecordDraw(UINT numVerts, const void* vertData, UINT stride, bool isRHW) {
+        if (!m_inspectorEnabled || m_drawRecordCount >= MAX_DRAW_RECORDS) return;
+        if (!vertData || numVerts == 0 || stride == 0) return;
+
+        DrawRecord& r = m_drawRecords[m_drawRecordCount];
+        r.matName = m_dbgMatName;
+        r.sceneNode = m_inspectorCurrentNode;
+        r.tex0Name[0] = 0; r.tex1Name[0] = 0;
+        r.tex0W = 0; r.tex0H = 0;
+        if (m_textures[0]) {
+            strncpy(r.tex0Name, m_textures[0]->m_srcName, 127); r.tex0Name[127] = 0;
+            r.tex0W = m_textures[0]->m_width; r.tex0H = m_textures[0]->m_height;
+        }
+        if (m_textures[1]) {
+            strncpy(r.tex1Name, m_textures[1]->m_srcName, 127); r.tex1Name[127] = 0;
+        }
+
+        // Compute screen-space AABB. Under bgfx we don't have a GL state
+        // mirror; use the present-params backbuffer size, which Set
+        // viewport keeps in sync with the active D3DVIEWPORT8.
+        float minSX = 1e9f, minSY = 1e9f, maxSX = -1e9f, maxSY = -1e9f;
+        extern D3DPRESENT_PARAMETERS g_pp;
+        int vp[4] = { 0, 0, (int)g_pp.BackBufferWidth, (int)g_pp.BackBufferHeight };
+        float vpW = (float)vp[2], vpH = (float)vp[3];
+
+        const BYTE* vd = (const BYTE*)vertData;
+        UpdateWVP();
+
+        for (UINT i = 0; i < numVerts; i++) {
+            const float* pos = (const float*)(vd + i * stride);
+            float sx, sy;
+            if (isRHW) {
+                sx = pos[0]; sy = pos[1];
+            } else {
+                // D3D row-vector: clip = pos * WVP
+                float x = pos[0], y = pos[1], z = pos[2];
+                float cx = x*m_matWVP.m[0][0] + y*m_matWVP.m[1][0] + z*m_matWVP.m[2][0] + m_matWVP.m[3][0];
+                float cy = x*m_matWVP.m[0][1] + y*m_matWVP.m[1][1] + z*m_matWVP.m[2][1] + m_matWVP.m[3][1];
+                float cw = x*m_matWVP.m[0][3] + y*m_matWVP.m[1][3] + z*m_matWVP.m[2][3] + m_matWVP.m[3][3];
+                if (cw < 0.001f) continue; // behind camera
+                float ndcx = cx / cw, ndcy = cy / cw;
+                sx = (ndcx * 0.5f + 0.5f) * vpW;
+                sy = (1.0f - (ndcy * 0.5f + 0.5f)) * vpH;
+            }
+            if (sx < minSX) minSX = sx;
+            if (sy < minSY) minSY = sy;
+            if (sx > maxSX) maxSX = sx;
+            if (sy > maxSY) maxSY = sy;
+        }
+        r.screenMinX = minSX; r.screenMinY = minSY;
+        r.screenMaxX = maxSX; r.screenMaxY = maxSY;
+        m_drawRecordCount++;
+    }
+
+    int InspectorHitTest(int mx, int my) {
+        m_inspectorHitID = -1;
+        m_inspectorText[0] = 0;
+        // Walk back-to-front: last drawn (topmost) wins
+        for (int i = m_drawRecordCount - 1; i >= 0; i--) {
+            const DrawRecord& r = m_drawRecords[i];
+            if (mx >= r.screenMinX && mx <= r.screenMaxX &&
+                my >= r.screenMinY && my <= r.screenMaxY) {
+                // Skip tiny/degenerate AABBs (< 4px)
+                if ((r.screenMaxX - r.screenMinX) < 4 || (r.screenMaxY - r.screenMinY) < 4) continue;
+                m_inspectorHitID = i;
+                snprintf(m_inspectorText, sizeof(m_inspectorText),
+                    "Material: %s | Tex0: %s (%ux%u)%s%s",
+                    r.matName ? r.matName : "(none)",
+                    r.tex0Name[0] ? r.tex0Name : "(none)", r.tex0W, r.tex0H,
+                    r.tex1Name[0] ? " | Tex1: " : "",
+                    r.tex1Name[0] ? r.tex1Name : "");
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // Force GL state to defaults and align the cache. Call after foreign code
+    // (libmpv, ImGui's GL3 backend) renders through our context.
+    void InvalidateStateCache() {
+        m_alphaBlendEnable = false;
+        m_zEnable = false;
+        m_zWriteEnable = true;
+        m_srcBlend  = 0xFFFFFFFF;
+        m_destBlend = 0xFFFFFFFF;
+        m_zFunc     = 0xFFFFFFFF;
+        m_cullMode  = 0xFFFFFFFF;
+        m_fillMode  = 0xFFFFFFFF;
+        m_tss0ColorOp = 0xFFFFFFFF; m_tss0ColorArg1 = 0xFFFFFFFF; m_tss0ColorArg2 = 0xFFFFFFFF;
+        m_tss0AlphaOp = 0xFFFFFFFF; m_tss0AlphaArg1 = 0xFFFFFFFF; m_tss0AlphaArg2 = 0xFFFFFFFF;
+        m_tss1ColorOp = 0xFFFFFFFF; m_tss1ColorArg1 = 0xFFFFFFFF; m_tss1ColorArg2 = 0xFFFFFFFF;
+        m_tss1AlphaOp = 0xFFFFFFFF; m_tss1AlphaArg1 = 0xFFFFFFFF; m_tss1AlphaArg2 = 0xFFFFFFFF;
+        m_tss0AddressU = D3DTADDRESS_WRAP; m_tss0AddressV = D3DTADDRESS_WRAP;
+        m_tss0MinFilter = D3DTEXF_LINEAR;  m_tss0MagFilter = D3DTEXF_LINEAR;
+        // CW winding matches D3D; don't add FRONT_CCW.
+        m_bgfxState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                    | BGFX_STATE_WRITE_Z;
+    }
+
+    HRESULT SetRenderState(DWORD state, DWORD value) {
+        // Sweep 2 trace counter (always on; cost ~4 instructions).
+        // F8 in the dashboard dumps top redundant + filtered states.
+        // See project_d3d_call_audit.md.
+        if (state < 256) {
+            g_rsStats[state].totalCalls++;
+            if (g_rsStats[state].hasValue && g_rsStats[state].lastValue == value)
+                g_rsStats[state].redundantCalls++;
+            g_rsStats[state].lastValue = value;
+            g_rsStats[state].hasValue = true;
+        }
+
+        // Skip dead state-sets at the top: NV2A-only, FF leftovers
+        // (fog/stencil/point sprite/vertex blend) the dashboard never uses.
+        switch (state) {
+            // Xbox-specific or already-stripped
+            case D3DRS_EDGEANTIALIAS:
+            case D3DRS_MULTISAMPLEANTIALIAS:
+            case D3DRS_MULTISAMPLEMASK:
+            case D3DRS_SWATHWIDTH:
+            // Fog: dashboard never enables it on desktop
+            case D3DRS_FOGENABLE:
+            case D3DRS_FOGCOLOR:
+            case D3DRS_FOGDENSITY:
+            case D3DRS_FOGEND:
+            case D3DRS_FOGSTART:
+            case D3DRS_FOGTABLEMODE:
+            case D3DRS_RANGEFOGENABLE:
+            // Point sprites: dashboard never uses
+            case D3DRS_POINTSIZE:
+            case D3DRS_POINTSIZE_MIN:
+            case D3DRS_POINTSCALEENABLE:
+            case D3DRS_POINTSPRITEENABLE:
+            case D3DRS_POINTSCALE_A:
+            case D3DRS_POINTSCALE_B:
+            case D3DRS_POINTSCALE_C:
+            // Stencil: not wired in the shim
+            case D3DRS_STENCILENABLE:
+            case D3DRS_STENCILFAIL:
+            case D3DRS_STENCILZFAIL:
+            case D3DRS_STENCILPASS:
+            case D3DRS_STENCILFUNC:
+            case D3DRS_STENCILREF:
+            case D3DRS_STENCILMASK:
+            case D3DRS_STENCILWRITEMASK:
+            // Indexed vertex blending for skeletal animation: not used
+            case D3DRS_VERTEXBLEND:
+            // Per-stage UVW wrap hints: GL handles wrap via sampler state
+            case D3DRS_WRAP0:
+            case D3DRS_WRAP1:
+            case D3DRS_WRAP2:
+            case D3DRS_WRAP3:
+            // Fixed-function lighting material sources / flags: no GL FF
+            case D3DRS_AMBIENT:
+            case D3DRS_AMBIENTMATERIALSOURCE:
+            case D3DRS_DIFFUSEMATERIALSOURCE:
+            case D3DRS_SPECULARMATERIALSOURCE:
+            case D3DRS_EMISSIVEMATERIALSOURCE:
+            case D3DRS_NORMALIZENORMALS:
+            case D3DRS_SPECULARENABLE:
+            case D3DRS_LOCALVIEWER:
+            // Misc no-ops on this shim
+            case D3DRS_DITHERENABLE:
+            case D3DRS_CLIPPING:
+            case D3DRS_SHADEMODE:
+            case D3DRS_ZBIAS:           // could map to glPolygonOffset, currently unused
+            case D3DRS_COLORWRITEENABLE: // could map to glColorMask, currently unused
+                if (state < 256) g_rsStats[state].filteredCalls++;
+                return S_OK;
+        }
+        if (state == D3DRS_TEXTUREFACTOR) m_texFactor = (D3DCOLOR)value;
+        else if (state == D3DRS_ALPHABLENDENABLE) {
+            bool nv = (value != 0);
+            if (nv == m_alphaBlendEnable) return S_OK;
+            m_alphaBlendEnable = nv;
+            RecomputeBgfxBlend();
+        }
+        else if (state == D3DRS_SRCBLEND) {
+            if (value == m_srcBlend) return S_OK;
+            m_srcBlend = value;
+            RecomputeBgfxBlend();
+        }
+        else if (state == D3DRS_DESTBLEND) {
+            if (value == m_destBlend) return S_OK;
+            m_destBlend = value;
+            RecomputeBgfxBlend();
+        }
+        else if (state == D3DRS_ZENABLE) {
+            bool nv = (value != 0);
+            if (nv == m_zEnable) return S_OK;
+            m_zEnable = nv;
+            // When depth test is off, bgfx wants the test bits zeroed.
+            // Re-application of the actual func happens via D3DRS_ZFUNC.
+            m_bgfxState &= ~BGFX_STATE_DEPTH_TEST_MASK;
+            if (nv) {
+                uint64_t f = BGFX_STATE_DEPTH_TEST_LEQUAL;
+                if (m_zFunc == D3DCMP_LESS) f = BGFX_STATE_DEPTH_TEST_LESS;
+                else if (m_zFunc == D3DCMP_ALWAYS) f = BGFX_STATE_DEPTH_TEST_ALWAYS;
+                m_bgfxState |= f;
+            }
+        }
+        else if (state == D3DRS_ZWRITEENABLE) {
+            bool nv = (value != 0);
+            if (nv == m_zWriteEnable) return S_OK;
+            m_zWriteEnable = nv;
+            if (nv) m_bgfxState |= BGFX_STATE_WRITE_Z;
+            else    m_bgfxState &= ~BGFX_STATE_WRITE_Z;
+        }
+        else if (state == D3DRS_ZFUNC) {
+            if (value == m_zFunc) return S_OK;
+            m_zFunc = value;
+            // Only emit DEPTH_TEST bits if the test is actually enabled;
+            // bgfx treats "no DEPTH_TEST bits set" as disabled.
+            if (m_zEnable) {
+                m_bgfxState &= ~BGFX_STATE_DEPTH_TEST_MASK;
+                uint64_t f = BGFX_STATE_DEPTH_TEST_LEQUAL;
+                if (value == D3DCMP_LESS) f = BGFX_STATE_DEPTH_TEST_LESS;
+                else if (value == D3DCMP_ALWAYS) f = BGFX_STATE_DEPTH_TEST_ALWAYS;
+                m_bgfxState |= f;
+            }
+        }
+        else if (state == D3DRS_CULLMODE) {
+            if (value == m_cullMode) return S_OK;
+            m_cullMode = value;
+            m_bgfxState &= ~BGFX_STATE_CULL_MASK;
+            if (value == D3DCULL_CW)       m_bgfxState |= BGFX_STATE_CULL_CW;
+            else if (value == D3DCULL_CCW) m_bgfxState |= BGFX_STATE_CULL_CCW;
+        }
+        else if (state == D3DRS_FILLMODE) {
+            if (value == m_fillMode) return S_OK;
+            m_fillMode = value;
+            // bgfx has no fill-mode; PT_LINES is a primitive-type override
+            // and only kinda approximates wireframe. Dashboard never sets
+            // wireframe, so leave the PT bits at default (tri-list).
+            m_bgfxState &= ~BGFX_STATE_PT_MASK;
+            if (value == D3DFILL_WIREFRAME) m_bgfxState |= BGFX_STATE_PT_LINES;
+        }
+        else if (state == D3DRS_LIGHTING) {
+            m_lighting = (value != 0);
+        }
+        else if (state == D3DRS_COLORVERTEX) {
+            m_colorVertex = (value != 0);
+        }
+        else if (state == D3DRS_ALPHATESTENABLE) {
+            m_alphaTestEnabled = (value != 0);
+        }
+        else if (state == D3DRS_ALPHAREF) {
+            m_alphaRef = (float)(value & 0xFF) / 255.0f;
+        }
+        else if (state == D3DRS_ALPHAFUNC) {
+            // Only GREATEREQUAL supported; just accept and return
+        }
+        return S_OK;
+    }
+
+
+    static uint64_t D3DBlendToBgfx(DWORD f) {
+        // Mirrors ApplyBlendFunc's switch: the shim's D3DBLEND_* enum
+        // only declares the six factors the dashboard actually uses.
+        switch (f) {
+            case D3DBLEND_ZERO:         return BGFX_STATE_BLEND_ZERO;
+            case D3DBLEND_ONE:          return BGFX_STATE_BLEND_ONE;
+            case D3DBLEND_SRCALPHA:     return BGFX_STATE_BLEND_SRC_ALPHA;
+            case D3DBLEND_INVSRCALPHA:  return BGFX_STATE_BLEND_INV_SRC_ALPHA;
+            case D3DBLEND_DESTALPHA:    return BGFX_STATE_BLEND_DST_ALPHA;
+            case D3DBLEND_INVDESTALPHA: return BGFX_STATE_BLEND_INV_DST_ALPHA;
+            default:                    return BGFX_STATE_BLEND_SRC_ALPHA;
+        }
+    }
+
+    void RecomputeBgfxBlend() {
+        // Recompute the blend bits from cached src/dest factors, read via
+        // m_bgfxState at draw time. Called when a factor or the enable flag
+        // changes.
+        m_bgfxState &= ~BGFX_STATE_BLEND_MASK;
+        if (m_alphaBlendEnable) {
+            uint64_t s = D3DBlendToBgfx(m_srcBlend);
+            uint64_t d = D3DBlendToBgfx(m_destBlend);
+            m_bgfxState |= BGFX_STATE_BLEND_FUNC(s, d);
+        }
+    }
+
+    HRESULT GetRenderState(D3DRENDERSTATETYPE state, DWORD* pValue) {
+        switch (state) {
+            case D3DRS_ZENABLE:          *pValue = m_zEnable ? 1 : 0; break;
+            case D3DRS_ZWRITEENABLE:     *pValue = m_zWriteEnable ? 1 : 0; break;
+            case D3DRS_ALPHABLENDENABLE: *pValue = m_alphaBlendEnable ? 1 : 0; break;
+            case D3DRS_SRCBLEND:         *pValue = m_srcBlend; break;
+            case D3DRS_DESTBLEND:        *pValue = m_destBlend; break;
+            case D3DRS_CULLMODE:         *pValue = m_cullMode; break;
+            case D3DRS_LIGHTING:         *pValue = m_lighting ? 1 : 0; break;
+            case D3DRS_COLORVERTEX:      *pValue = m_colorVertex ? 1 : 0; break;
+            case D3DRS_TEXTUREFACTOR:    *pValue = m_texFactor; break;
+            default: *pValue = 0; break;
+        }
+        return S_OK;
+    }
+    // BGFX_SAMPLER_* flag block derived from current stage-0 sampler
+    // state. Default is REPEAT + LINEAR which is bgfx's implicit state,
+    // so writes only set bits when the dashboard explicitly overrides.
+    uint32_t BgfxStage0SamplerFlags() const {
+        uint32_t f = 0;
+        if (m_tss0AddressU == D3DTADDRESS_CLAMP)  f |= BGFX_SAMPLER_U_CLAMP;
+        if (m_tss0AddressU == D3DTADDRESS_MIRROR) f |= BGFX_SAMPLER_U_MIRROR;
+        if (m_tss0AddressV == D3DTADDRESS_CLAMP)  f |= BGFX_SAMPLER_V_CLAMP;
+        if (m_tss0AddressV == D3DTADDRESS_MIRROR) f |= BGFX_SAMPLER_V_MIRROR;
+        if (m_tss0MinFilter == D3DTEXF_POINT)     f |= BGFX_SAMPLER_MIN_POINT;
+        if (m_tss0MagFilter == D3DTEXF_POINT)     f |= BGFX_SAMPLER_MAG_POINT;
+        return f;
+    }
+    static GLenum D3DFilterToGL(DWORD d3dFilter, bool isMag) {
+        switch (d3dFilter) {
+            case 1: return GL_NEAREST;  // D3DTEXF_POINT
+            case 2: return GL_LINEAR;   // D3DTEXF_LINEAR
+            default: return isMag ? GL_LINEAR : GL_LINEAR; // ANISOTROPIC/QUINCUNX/GAUSSIAN → linear
+        }
+    }
+    HRESULT SetTextureStageState(DWORD stage, D3DTEXTURESTAGESTATETYPE type, DWORD value) {
+        // Sweep 2 trace counter.
+        if (stage < 8 && (DWORD)type < 32) {
+            int idx = (int)stage * 32 + (int)type;
+            g_tssStats[idx].totalCalls++;
+            if (g_tssStats[idx].hasValue && g_tssStats[idx].lastValue == value)
+                g_tssStats[idx].redundantCalls++;
+            g_tssStats[idx].lastValue = value;
+            g_tssStats[idx].hasValue = true;
+        }
+
+        if (stage == 0) {
+            switch (type) {
+                case D3DTSS_COLOROP:   m_tss0ColorOp   = value; break;
+                case D3DTSS_COLORARG1: m_tss0ColorArg1  = value; break;
+                case D3DTSS_COLORARG2: m_tss0ColorArg2  = value; break;
+                case D3DTSS_ALPHAOP:   m_tss0AlphaOp   = value; break;
+                case D3DTSS_ALPHAARG1: m_tss0AlphaArg1  = value; break;
+                case D3DTSS_ALPHAARG2: m_tss0AlphaArg2  = value; break;
+                case D3DTSS_ADDRESSU: m_tss0AddressU  = value; break;
+                case D3DTSS_ADDRESSV: m_tss0AddressV  = value; break;
+                case D3DTSS_MINFILTER: m_tss0MinFilter = value; break;
+                case D3DTSS_MAGFILTER: m_tss0MagFilter = value; break;
+                default: break;
+            }
+        } else if (stage == 1) {
+            switch (type) {
+                case D3DTSS_COLOROP:   m_tss1ColorOp   = value; break;
+                case D3DTSS_COLORARG1: m_tss1ColorArg1  = value; break;
+                case D3DTSS_COLORARG2: m_tss1ColorArg2  = value; break;
+                case D3DTSS_ALPHAOP:   m_tss1AlphaOp   = value; break;
+                case D3DTSS_ALPHAARG1: m_tss1AlphaArg1  = value; break;
+                case D3DTSS_ALPHAARG2: m_tss1AlphaArg2  = value; break;
+                default: break;
+            }
+        }
+        return S_OK;
+    }
+    HRESULT GetTextureStageState(DWORD stage, D3DTEXTURESTAGESTATETYPE type, DWORD* pValue) { *pValue = 0; return S_OK; }
+    HRESULT SetTexture(DWORD stage, IDirect3DTexture8* tex) {
+        if (stage < 4) m_textures[stage] = tex;
+        return S_OK;
+    }
+    HRESULT SetMaterial(D3DMATERIAL8* mat) {
+        if (mat) {
+            BYTE a = (BYTE)(mat->Diffuse.a * 255.0f);
+            BYTE r = (BYTE)(mat->Diffuse.r * 255.0f);
+            BYTE g = (BYTE)(mat->Diffuse.g * 255.0f);
+            BYTE b = (BYTE)(mat->Diffuse.b * 255.0f);
+            m_matDiffuse = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+        return S_OK;
+    }
+    HRESULT SetTransform(D3DTRANSFORMSTATETYPE type, D3DMATRIX* mat) {
+        if (type == D3DTS_WORLD) { m_matWorld = *(D3DXMATRIX*)mat; m_wvpDirty = true; }
+        else if (type == D3DTS_VIEW) { m_matView = *(D3DXMATRIX*)mat; m_wvpDirty = true; }
+        else if (type == D3DTS_PROJECTION) { m_matProj = *(D3DXMATRIX*)mat; m_wvpDirty = true; }
+        return S_OK;
+    }
+    HRESULT GetTransform(D3DTRANSFORMSTATETYPE type, D3DMATRIX* mat) {
+        if (type == D3DTS_WORLD) *mat = m_matWorld;
+        else if (type == D3DTS_VIEW) *mat = m_matView;
+        else if (type == D3DTS_PROJECTION) *mat = m_matProj;
+        else D3DXMatrixIdentity((D3DXMATRIX*)mat);
+        return S_OK;
+    }
+    HRESULT SetLight(DWORD index, D3DLIGHT8* light) { return S_OK; }
+    HRESULT LightEnable(DWORD index, BOOL enable) { return S_OK; }
+
+    HRESULT Clear(DWORD count, const void* rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) {
+        // bgfx clears are configured per-view, applied at the next submit
+        // to that view. View 0 is the dashboard's only view.
+        uint16_t bgMask = 0;
+        uint32_t rgba = 0;
+        if (flags & D3DCLEAR_TARGET) {
+            // D3DCOLOR is 0xAARRGGBB; bgfx wants 0xRRGGBBAA.
+            uint32_t r = (color >> 16) & 0xFF;
+            uint32_t g = (color >>  8) & 0xFF;
+            uint32_t b = (color      ) & 0xFF;
+            uint32_t a = (color >> 24) & 0xFF;
+            rgba = (r << 24) | (g << 16) | (b << 8) | a;
+            bgMask |= BGFX_CLEAR_COLOR;
+        }
+        if (flags & D3DCLEAR_ZBUFFER) bgMask |= BGFX_CLEAR_DEPTH;
+        if (bgMask) {
+            bgfx::setViewClear(0, bgMask, rgba, z, (uint8_t)stencil);
+            // touch() guarantees the view actually runs even with no
+            // draws submitted before bgfx::frame() (rare, but happens
+            // on the first frame before any geometry queues up).
+            bgfx::touch(0);
+        }
+        return S_OK;
+    }
+
+    int m_frameDrawCalls;  // per-frame draw call counter
+    int m_frameNumber;
+    HRESULT BeginScene() { InspectorBeginFrame(); m_frameDrawCalls = 0; return S_OK; }
+    HRESULT EndScene() {
+        m_frameNumber++;
+        return S_OK;
+    }
+
+    // Pre-swap callback for overlays (set by main loop)
+    typedef void (*PreSwapCallback)(void);
+    static PreSwapCallback s_preSwapCB;
+
+    HRESULT Present(const void* src, const void* dst, void* wnd, const void* dirty) {
+        // Run inspector hit test before swapping
+        if (m_inspectorEnabled && m_drawRecordCount > 0) {
+            m_inspectorHitID = InspectorHitTest(m_mouseX, m_mouseY);
+        }
+        // Main loop handles overlay rendering and swap after Draw()
+        return S_OK;
+    }
+
+    HRESULT SetVertexShader(DWORD handle) {
+        m_envMapMode = false;  // Reset per-material; reflection sets c48 after this
+        if (handle & 0x80000000) {
+            // Effect shader sentinel from GetEffectShader(): high bit = effect active,
+            // low bits = real FVF for vertex attribute layout
+            m_fvf = handle & 0x7FFFFFFF;
+            m_effectShaderActive = true;
+        } else if (handle & (D3DFVF_XYZ | D3DFVF_XYZRHW)) {
+            m_fvf = handle;
+            m_effectShaderActive = false;
+        } else {
+            m_effectShaderActive = true;
+        }
+        return S_OK;
+    }
+    HRESULT SetVertexShaderConstant(DWORD reg, const void* data, DWORD count) {
+        const float* f = (const float*)data;
+        for (DWORD i = 0; i < count; i++) {
+            DWORD r = reg + i;
+            if (r >= 5 && r <= 8) { memcpy(m_normalInv + (r-5)*4, f + i*4, 16); } // c5-c8: WV^-1
+            if (r == 15) memcpy(m_falloffFront, f + i*4, 16);
+            if (r == 16) memcpy(m_falloffDelta, f + i*4, 16);
+            if (r == 48) m_envMapMode = true;
+        }
+        return S_OK;
+    }
+
+    IDirect3DVertexBuffer8* m_streamVB;
+    IDirect3DIndexBuffer8* m_streamIB;
+    UINT m_streamStride;
+    UINT m_baseVertex;
+
+    HRESULT SetStreamSource(UINT stream, IDirect3DVertexBuffer8* vb, UINT stride) {
+        if (stream == 0) { m_streamVB = vb; m_streamStride = stride; }
+        return S_OK;
+    }
+    HRESULT SetIndices(IDirect3DIndexBuffer8* ib, UINT baseVertex) {
+        m_streamIB = ib; m_baseVertex = baseVertex;
+        return S_OK;
+    }
+
+    // FVF layout helper
+    struct FVFLayout {
+        UINT posSize;
+        bool hasRHW, hasNormal, hasPackedNormal, hasDiffuse, hasSpecular;
+        int texCount;
+        UINT normalOff, colorOff, specOff, texOff;
+    };
+    FVFLayout GetFVFLayout(DWORD fvf) {
+        FVFLayout l = {};
+        l.hasRHW = (fvf & D3DFVF_XYZRHW) != 0;
+        l.posSize = l.hasRHW ? 16 : 12;
+        l.hasNormal = (fvf & D3DFVF_NORMAL) != 0;
+        l.hasPackedNormal = (fvf & D3DFVF_NORMPACKED3) != 0;
+        l.hasDiffuse = (fvf & D3DFVF_DIFFUSE) != 0;
+        l.hasSpecular = (fvf & D3DFVF_SPECULAR) != 0;
+        l.texCount = (fvf >> 8) & 0xF;
+        UINT off = l.posSize;
+        l.normalOff = off;
+        if (l.hasNormal) off += 12;
+        else if (l.hasPackedNormal) off += 4;
+        l.colorOff = off; if (l.hasDiffuse) off += 4;
+        l.specOff = off; if (l.hasSpecular) off += 4;
+        l.texOff = off;
+        return l;
+    }
+
+    // Lazy-upload a texture's RGBA pixel data to its bgfx handle.
+    static void BgfxEnsureTextureUploaded(IDirect3DTexture8* tex) {
+        if (!tex || !tex->m_pixels) return;
+        if (tex->m_width == 0 || tex->m_height == 0) return;
+        UINT sz = tex->m_width * tex->m_height * 4;
+        if (!bgfx::isValid(tex->m_bgfxTex)) {
+            // BLIT_DST on Metal selects shared-storage mode that allows
+            // CPU-side updates via updateTexture2D. Without it bgfx may
+            // place the texture in private GPU memory and silently drop
+            // subsequent CPU writes. Dynamic textures (audio visualizer,
+            // any async asset upload) freeze on the first frame.
+            tex->m_bgfxTex = bgfx::createTexture2D(
+                (uint16_t)tex->m_width, (uint16_t)tex->m_height,
+                false, 1,
+                bgfx::TextureFormat::RGBA8,
+                BGFX_TEXTURE_BLIT_DST,
+                nullptr);
+            tex->m_bgfxDirty = true;
+        }
+        if (bgfx::isValid(tex->m_bgfxTex) && tex->m_bgfxDirty) {
+            bgfx::updateTexture2D(tex->m_bgfxTex, 0, 0, 0, 0,
+                (uint16_t)tex->m_width, (uint16_t)tex->m_height,
+                bgfx::copy(tex->m_pixels, sz));
+            tex->m_bgfxDirty = false;
+        }
+    }
+
+    // Pack + push every FF uniform, bind the two samplers. WVP / WorldView
+    // ship raw row-major; NormalInv pre-transposed (bgfx has no GL_TRUE flag).
+    void BgfxSetupUniforms(const FVFLayout& l) {
+        UpdateWVP();
+
+        bgfx::setUniform(g_bgfxFF.u_FfWVP,       &m_matWVP.m[0][0]);
+        bgfx::setUniform(g_bgfxFF.u_FfWorldView, &m_matWV.m[0][0]);
+
+        // Pre-transpose normalInv to match GL's GL_TRUE transpose.
+        float niT[16];
+        for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++)
+            niT[c*4 + r] = m_normalInv[r*4 + c];
+        bgfx::setUniform(g_bgfxFF.u_FfNormalInv, niT);
+
+        bgfx::setUniform(g_bgfxFF.u_FfFalloffFront, m_falloffFront);
+        bgfx::setUniform(g_bgfxFF.u_FfFalloffDelta, m_falloffDelta);
+
+        float tf[4] = {
+            ((m_texFactor >> 16) & 0xFF) / 255.0f,
+            ((m_texFactor >> 8)  & 0xFF) / 255.0f,
+            ( m_texFactor        & 0xFF) / 255.0f,
+            ((m_texFactor >> 24) & 0xFF) / 255.0f
+        };
+        bgfx::setUniform(g_bgfxFF.u_FfTFactor, tf);
+
+        float md[4] = {
+            ((m_matDiffuse >> 16) & 0xFF) / 255.0f,
+            ((m_matDiffuse >> 8)  & 0xFF) / 255.0f,
+            ( m_matDiffuse        & 0xFF) / 255.0f,
+            ((m_matDiffuse >> 24) & 0xFF) / 255.0f
+        };
+        bgfx::setUniform(g_bgfxFF.u_FfMatDiffuse, md);
+
+        // Derive the TSS state the FF shader needs, matching what the
+        // fixed-function pipeline produced.
+        bool tex0Valid = m_textures[0] && m_textures[0]->m_pixels;
+        bool tex1Valid = m_textures[1] && m_textures[1]->m_pixels;
+        bool hasNrm = l.hasNormal || l.hasPackedNormal;
+        int  nrmType = l.hasNormal ? 1 : (l.hasPackedNormal ? 2 : 0);
+
+        bool stageRefsTex = (m_tss0ColorArg1 == D3DTA_TEXTURE || m_tss0ColorArg2 == D3DTA_TEXTURE ||
+                             m_tss0AlphaArg1 == D3DTA_TEXTURE || m_tss0AlphaArg2 == D3DTA_TEXTURE);
+        bool hasTex0 = stageRefsTex && tex0Valid;
+        bool hasTex1 = tex1Valid && m_tss1AlphaOp != D3DTOP_DISABLE;
+
+        // Vertex color source
+        int colorSource = 3;
+        int alphaSource = 0;
+        float alphaMul  = 1.0f;
+        if (m_tss0ColorOp == D3DTOP_DISABLE) {
+            colorSource = (hasNrm || m_effectShaderActive) ? 0 : 4;
+        } else if (m_tss0ColorOp == D3DTOP_SELECTARG1) {
+            if (m_tss0ColorArg1 == D3DTA_TFACTOR) colorSource = 2;
+            else if (m_tss0ColorArg1 == D3DTA_TEXTURE) colorSource = 3;
+            else if (m_tss0ColorArg1 == D3DTA_DIFFUSE) colorSource = (hasNrm || m_effectShaderActive) ? 0 : (l.hasDiffuse ? 1 : 4);
+            else colorSource = 3;
+        } else if (m_tss0ColorOp == D3DTOP_SELECTARG2) {
+            if (m_tss0ColorArg2 == D3DTA_TFACTOR) colorSource = 2;
+            else if (m_tss0ColorArg2 == D3DTA_TEXTURE) colorSource = 3;
+            else if (m_tss0ColorArg2 == D3DTA_DIFFUSE) colorSource = (hasNrm || m_effectShaderActive) ? 0 : (l.hasDiffuse ? 1 : 4);
+            else colorSource = 3;
+        } else if (m_tss0ColorOp == D3DTOP_MODULATE) {
+            DWORD nonTexArg = (m_tss0ColorArg1 == D3DTA_TEXTURE) ? m_tss0ColorArg2 : m_tss0ColorArg1;
+            if (nonTexArg == D3DTA_DIFFUSE) colorSource = (hasNrm || m_effectShaderActive) ? 0 : (l.hasDiffuse ? 1 : 4);
+            else if (nonTexArg == D3DTA_TFACTOR) colorSource = 2;
+            else colorSource = 3;
+        }
+
+        // Vertex alpha source
+        if (m_tss0AlphaOp == D3DTOP_DISABLE) {
+            alphaSource = 0;
+        } else if (m_tss0AlphaOp == D3DTOP_SELECTARG1) {
+            if (m_tss0AlphaArg1 == D3DTA_TFACTOR) alphaSource = 1;
+            else if (m_tss0AlphaArg1 == D3DTA_TEXTURE) alphaSource = 3;
+            else if (m_tss0AlphaArg1 == D3DTA_DIFFUSE) alphaSource = (hasNrm || m_effectShaderActive) ? 0 : 2;
+            else alphaSource = 3;
+        } else if (m_tss0AlphaOp == D3DTOP_SELECTARG2) {
+            if (m_tss0AlphaArg2 == D3DTA_TFACTOR) alphaSource = 1;
+            else if (m_tss0AlphaArg2 == D3DTA_TEXTURE) alphaSource = 3;
+            else if (m_tss0AlphaArg2 == D3DTA_DIFFUSE) alphaSource = (hasNrm || m_effectShaderActive) ? 0 : 2;
+            else alphaSource = 3;
+        } else if (m_tss0AlphaOp == D3DTOP_MODULATE) {
+            bool a1Tex = (m_tss0AlphaArg1 == D3DTA_TEXTURE);
+            bool a2Tex = (m_tss0AlphaArg2 == D3DTA_TEXTURE);
+            if (a1Tex || a2Tex) {
+                DWORD nonTex = a1Tex ? m_tss0AlphaArg2 : m_tss0AlphaArg1;
+                if (nonTex == D3DTA_TFACTOR) alphaSource = 1;
+                else if (nonTex == D3DTA_DIFFUSE) alphaSource = (hasNrm || m_effectShaderActive) ? 0 : 2;
+                else alphaSource = 0;
+            } else {
+                if ((m_tss0AlphaArg1 == D3DTA_DIFFUSE && m_tss0AlphaArg2 == D3DTA_TFACTOR) ||
+                    (m_tss0AlphaArg1 == D3DTA_TFACTOR && m_tss0AlphaArg2 == D3DTA_DIFFUSE))
+                    alphaSource = 1;
+                else
+                    alphaSource = 0;
+            }
+        }
+
+        // Stage 1 alpha modulation by TFACTOR
+        if (m_tss1AlphaOp == D3DTOP_MODULATE && !hasTex1) {
+            DWORD s1arg = (m_tss1AlphaArg1 == D3DTA_CURRENT) ? m_tss1AlphaArg2 : m_tss1AlphaArg1;
+            if (s1arg == D3DTA_TFACTOR)
+                alphaMul = ((m_texFactor >> 24) & 0xFF) / 255.0f;
+        }
+
+        // Fragment ops
+        int fragColorOp = 0;
+        int fragAlphaOp = 0;
+        if (m_tss0ColorOp == D3DTOP_SELECTARG1) {
+            if (m_tss0ColorArg1 == D3DTA_TEXTURE && hasTex0) fragColorOp = 1;
+        } else if (m_tss0ColorOp == D3DTOP_SELECTARG2) {
+            if (m_tss0ColorArg2 == D3DTA_TEXTURE && hasTex0) fragColorOp = 1;
+        } else if (m_tss0ColorOp == D3DTOP_MODULATE) {
+            if (hasTex0) fragColorOp = 2;
+        } else if (m_tss0ColorOp == D3DTOP_ADD) {
+            if (hasTex0) fragColorOp = 3;
+        }
+        if (m_tss0AlphaOp == D3DTOP_SELECTARG1) {
+            if (m_tss0AlphaArg1 == D3DTA_TEXTURE && hasTex0) fragAlphaOp = 1;
+        } else if (m_tss0AlphaOp == D3DTOP_SELECTARG2) {
+            if (m_tss0AlphaArg2 == D3DTA_TEXTURE && hasTex0) fragAlphaOp = 1;
+        } else if (m_tss0AlphaOp == D3DTOP_MODULATE) {
+            bool refsTex = (m_tss0AlphaArg1 == D3DTA_TEXTURE || m_tss0AlphaArg2 == D3DTA_TEXTURE);
+            if (refsTex && hasTex0) fragAlphaOp = 2;
+        }
+
+        int tex1AlphaOp = 0;
+        if (hasTex1 && m_tss1AlphaOp == D3DTOP_MODULATE &&
+            (m_tss1AlphaArg1 == D3DTA_TEXTURE || m_tss1AlphaArg2 == D3DTA_TEXTURE))
+            tex1AlphaOp = 1;
+        int tex1ColorOp = 0;
+        if (hasTex1 && m_tss1ColorOp == D3DTOP_ADD &&
+            (m_tss1ColorArg1 == D3DTA_TEXTURE || m_tss1ColorArg2 == D3DTA_TEXTURE))
+            tex1ColorOp = 1;
+
+        float alphaRefVal = m_alphaTestEnabled ? m_alphaRef : 0.0f;
+
+        // Pack the flag vec4s
+        float flags1[4] = { l.hasRHW ? 1.0f : 0.0f, (float)colorSource, (float)alphaSource, (float)nrmType };
+        float flags2[4] = { m_envMapMode ? 1.0f : 0.0f, m_vertexAlphaMul ? 1.0f : 0.0f, alphaMul, 0.0f };
+        float fragFlags1[4] = { (float)fragColorOp, (float)fragAlphaOp, hasTex1 ? 1.0f : 0.0f, (float)tex1AlphaOp };
+        float fragFlags2[4] = { (float)tex1ColorOp, alphaRefVal, 0.0f, 0.0f };
+        float vps[4] = { 1280.0f, 720.0f, 0.0f, 0.0f };
+        bgfx::setUniform(g_bgfxFF.u_FfFlags1,       flags1);
+        bgfx::setUniform(g_bgfxFF.u_FfFlags2,       flags2);
+        bgfx::setUniform(g_bgfxFF.u_FfFragFlags1,   fragFlags1);
+        bgfx::setUniform(g_bgfxFF.u_FfFragFlags2,   fragFlags2);
+        bgfx::setUniform(g_bgfxFF.u_FfViewportSize, vps);
+
+        // Samplers. Upload textures lazily; if no real texture, use the
+        // 1x1 white placeholder so the shader sample is well-defined.
+        bgfx::TextureHandle t0 = g_bgfxWhiteTex;
+        if (hasTex0) {
+            BgfxEnsureTextureUploaded(m_textures[0]);
+            if (bgfx::isValid(m_textures[0]->m_bgfxTex))
+                t0 = m_textures[0]->m_bgfxTex;
+        }
+        bgfx::setTexture(0, g_bgfxFF.s_tex0, t0, BgfxStage0SamplerFlags());
+
+        bgfx::TextureHandle t1 = g_bgfxWhiteTex;
+        if (hasTex1) {
+            BgfxEnsureTextureUploaded(m_textures[1]);
+            if (bgfx::isValid(m_textures[1]->m_bgfxTex))
+                t1 = m_textures[1]->m_bgfxTex;
+        }
+        bgfx::setTexture(1, g_bgfxFF.s_tex1, t1);
+    }
+
+    // Submit DrawIndexedPrimitive through bgfx (dynamic VB + transient IB).
+    // ExpandIndices subtracts minIdx; bgfx adds back m_baseVertex.
+    // STRIP / FAN expand to TRILIST, so bgfx only sees triangle lists.
+    void BgfxShadowSubmit(DWORD type, UINT minIdx, UINT numVerts,
+                          UINT startIdx, UINT primCount) {
+        if (!bgfx::isValid(g_bgfxProgFF)) return;
+        if (type != D3DPT_TRIANGLELIST &&
+            type != D3DPT_TRIANGLESTRIP &&
+            type != D3DPT_TRIANGLEFAN) return;
+        if (!m_streamVB || !m_streamIB) return;
+        if (m_streamStride == 0) return;
+
+        bgfx::VertexLayout layout;
+        if (!BuildBgfxLayout(m_fvf, layout)) return;
+
+        UINT vbSize = m_streamVB->GetSize();
+        if (!bgfx::isValid(m_streamVB->m_bgfxVB)) {
+            uint32_t nv = vbSize / m_streamStride;
+            if (nv == 0) return;
+            m_streamVB->m_bgfxVB =
+                bgfx::createDynamicVertexBuffer(nv, layout);
+            m_streamVB->m_bgfxDirty = true;
+        }
+        if (m_streamVB->m_bgfxDirty) {
+            bgfx::update(m_streamVB->m_bgfxVB, 0,
+                bgfx::copy(m_streamVB->m_data, vbSize));
+            m_streamVB->m_bgfxDirty = false;
+        }
+
+        const WORD* srcIdx = (const WORD*)m_streamIB->m_data + startIdx;
+        UINT idxCount = 0;
+        GLushort* triIdx = ExpandIndices(type, primCount, srcIdx,
+                                         minIdx, idxCount);
+        if (!triIdx || idxCount == 0) return;
+
+        bgfx::TransientIndexBuffer tib;
+        if (bgfx::getAvailTransientIndexBuffer(idxCount) < idxCount) return;
+        bgfx::allocTransientIndexBuffer(&tib, idxCount);
+        memcpy(tib.data, triIdx, idxCount * sizeof(uint16_t));
+
+        FVFLayout l = GetFVFLayout(m_fvf);
+        BgfxSetupUniforms(l);
+
+        bgfx::setState(m_bgfxState);
+        bgfx::setVertexBuffer(0, m_streamVB->m_bgfxVB,
+                              m_baseVertex, numVerts);
+        bgfx::setIndexBuffer(&tib, 0, idxCount);
+        bgfx::submit(0, g_bgfxProgFF);
+    }
+
+    // DrawPrimitiveUP / DrawIndexedPrimitiveUP go through transient buffers
+    // since the caller hands raw vertex/index data per draw. QUADLIST is
+    // expanded inline. indexData=nullptr means non-indexed.
+    void BgfxShadowSubmitUP(DWORD type, UINT primCount,
+                            const void* vertexData, UINT vertexStride,
+                            UINT numVerts,
+                            const WORD* indexData, UINT minIdx) {
+        if (!bgfx::isValid(g_bgfxProgFF)) return;
+        if (!vertexData || vertexStride == 0 || numVerts == 0) return;
+        if (type != D3DPT_TRIANGLELIST &&
+            type != D3DPT_TRIANGLESTRIP &&
+            type != D3DPT_TRIANGLEFAN &&
+            type != D3DPT_QUADLIST) return;
+
+        bgfx::VertexLayout layout;
+        if (!BuildBgfxLayout(m_fvf, layout)) return;
+
+        // Transient VB. Copy the raw user data in.
+        bgfx::TransientVertexBuffer tvb;
+        if (bgfx::getAvailTransientVertexBuffer(numVerts, layout) < numVerts) return;
+        bgfx::allocTransientVertexBuffer(&tvb, numVerts, layout);
+        memcpy(tvb.data, vertexData, (size_t)numVerts * vertexStride);
+
+        // QUADLIST expands inline. TRILIST/STRIP/FAN go through ExpandIndices.
+        // Both paths emit into the shared scratch buffer.
+        UINT idxCount = 0;
+        const uint16_t* idxSrc = nullptr;
+        if (type == D3DPT_QUADLIST) {
+            idxCount = primCount * 6;
+            GLushort* s = GetIndexScratch(idxCount);
+            if (!s) return;
+            UINT n = 0;
+            for (UINT q = 0; q < primCount; q++) {
+                GLushort b = (GLushort)(q * 4);
+                s[n++] = b;       s[n++] = (GLushort)(b+1); s[n++] = (GLushort)(b+2);
+                s[n++] = b;       s[n++] = (GLushort)(b+2); s[n++] = (GLushort)(b+3);
+            }
+            idxSrc = (const uint16_t*)s;
+        } else if (indexData != nullptr) {
+            GLushort* tri = ExpandIndices(type, primCount, indexData,
+                                          minIdx, idxCount);
+            if (!tri || idxCount == 0) return;
+            idxSrc = (const uint16_t*)tri;
+        } else {
+            // Non-indexed (DrawPrimitiveUP TRILIST/STRIP/FAN): emit
+            // sequential indices into scratch so the same submit path
+            // applies.
+            idxCount = primCount * 3;
+            GLushort* s = GetIndexScratch(idxCount);
+            if (!s) return;
+            UINT n = 0;
+            if (type == D3DPT_TRIANGLELIST) {
+                for (UINT i = 0; i < primCount; i++) {
+                    GLushort b = (GLushort)(i * 3);
+                    s[n++] = b; s[n++] = (GLushort)(b+1); s[n++] = (GLushort)(b+2);
+                }
+            } else if (type == D3DPT_TRIANGLESTRIP) {
+                for (UINT i = 0; i < primCount; i++) {
+                    if (i % 2 == 0) {
+                        s[n++] = (GLushort)i; s[n++] = (GLushort)(i+1); s[n++] = (GLushort)(i+2);
+                    } else {
+                        s[n++] = (GLushort)(i+1); s[n++] = (GLushort)i; s[n++] = (GLushort)(i+2);
+                    }
+                }
+            } else /* FAN */ {
+                for (UINT i = 0; i < primCount; i++) {
+                    s[n++] = 0; s[n++] = (GLushort)(i+1); s[n++] = (GLushort)(i+2);
+                }
+            }
+            idxSrc = (const uint16_t*)s;
+        }
+
+        bgfx::TransientIndexBuffer tib;
+        if (bgfx::getAvailTransientIndexBuffer(idxCount) < idxCount) return;
+        bgfx::allocTransientIndexBuffer(&tib, idxCount);
+        memcpy(tib.data, idxSrc, idxCount * sizeof(uint16_t));
+
+        FVFLayout l = GetFVFLayout(m_fvf);
+        BgfxSetupUniforms(l);
+
+        bgfx::setState(m_bgfxState);
+        bgfx::setVertexBuffer(0, &tvb, 0, numVerts);
+        bgfx::setIndexBuffer(&tib, 0, idxCount);
+        bgfx::submit(0, g_bgfxProgFF);
+    }
+
+    // FVF -> bgfx::VertexLayout. Mirrors GetFVFLayout. Returns false for
+    // FVFs the bgfx path doesn't support yet (XYZRHW HUD).
+    bool BuildBgfxLayout(DWORD fvf, bgfx::VertexLayout& out) {
+        FVFLayout l = GetFVFLayout(fvf);
+        if (l.hasRHW) return false;
+
+        out.begin();
+        out.add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float);
+        // Float3 normal -> Normal attr. Packed 11:11:10 -> hijack Color1.
+        if (l.hasNormal)
+            out.add(bgfx::Attrib::Normal, 3, bgfx::AttribType::Float);
+        else if (l.hasPackedNormal)
+            // asInt=true Uint8x4 maps to UINT on Vulkan, mismatched with vec4
+            // a_color1 in the shader. normalized=true gives UNORM on both
+            // backends; the shader scales by 255.
+            out.add(bgfx::Attrib::Color1, 4, bgfx::AttribType::Uint8, true);
+        if (l.hasDiffuse)
+            out.add(bgfx::Attrib::Color0, 4, bgfx::AttribType::Uint8, true);
+        // Specular bytes are unused but have to occupy stride so TexCoord0
+        // lines up. Color2 carries them when packed-normal claimed Color1.
+        if (l.hasSpecular)
+            out.add(l.hasPackedNormal ? bgfx::Attrib::Color2
+                                       : bgfx::Attrib::Color1,
+                    4, bgfx::AttribType::Uint8, true);
+        if (l.texCount >= 1)
+            out.add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float);
+        out.end();
+        return true;
+    }
+
+    // Set GL uniforms for the current TSS/material/falloff state before a draw call
+    void SetupGLUniforms(const FVFLayout& l) {
+    }
+
+    // Set up vertex attribute pointers for the given FVF layout
+    // bufferOffset = byte offset into the currently bound VBO
+    void SetupVertexAttribs(const FVFLayout& l, UINT stride, size_t bufferOffset) {
+    }
+
+    // Expand STRIP/FAN to TRILIST. Scratch buffer is grown on demand and
+    // kept for the device's lifetime (was burning ~12K mallocs/sec at 60fps).
+    // GLushort because D3D8 index buffers are WORDs.
+    static GLushort* GetIndexScratch(UINT count) {
+        static GLushort* s_buf = nullptr;
+        static UINT      s_cap = 0;
+        if (count > s_cap) {
+            UINT newCap = s_cap ? s_cap * 2 : 256;
+            while (newCap < count) newCap *= 2;
+            GLushort* nb = (GLushort*)realloc(s_buf, newCap * sizeof(GLushort));
+            if (!nb) return nullptr;
+            s_buf = nb;
+            s_cap = newCap;
+        }
+        return s_buf;
+    }
+
+    // Returns a pointer into the shared scratch buffer. Caller must NOT
+    // free; pointer is valid until the next ExpandIndices call.
+    GLushort* ExpandIndices(DWORD type, UINT primCount, const WORD* srcIdx, UINT minIdx, UINT& outCount) {
+        if (type == D3DPT_TRIANGLELIST) {
+            outCount = primCount * 3;
+            GLushort* idx = GetIndexScratch(outCount);
+            if (!idx) return nullptr;
+            if (minIdx == 0) {
+                // Common case: just copy. Same width source and dest.
+                memcpy(idx, srcIdx, outCount * sizeof(GLushort));
+            } else {
+                for (UINT i = 0; i < outCount; i++) idx[i] = (GLushort)(srcIdx[i] - minIdx);
+            }
+            return idx;
+        } else if (type == D3DPT_TRIANGLESTRIP) {
+            outCount = primCount * 3;
+            GLushort* idx = GetIndexScratch(outCount);
+            if (!idx) return nullptr;
+            UINT n = 0;
+            for (UINT i = 0; i < primCount; i++) {
+                GLushort i0 = srcIdx[i] - minIdx, i1 = srcIdx[i+1] - minIdx, i2 = srcIdx[i+2] - minIdx;
+                if (i % 2 == 0) { idx[n++]=i0; idx[n++]=i1; idx[n++]=i2; }
+                else { idx[n++]=i1; idx[n++]=i0; idx[n++]=i2; }
+            }
+            outCount = n;
+            return idx;
+        } else if (type == D3DPT_TRIANGLEFAN) {
+            outCount = primCount * 3;
+            GLushort* idx = GetIndexScratch(outCount);
+            if (!idx) return nullptr;
+            UINT n = 0;
+            GLushort i0 = srcIdx[0] - minIdx;
+            for (UINT i = 0; i < primCount; i++) {
+                idx[n++]=i0; idx[n++]=srcIdx[i+1]-minIdx; idx[n++]=srcIdx[i+2]-minIdx;
+            }
+            outCount = n;
+            return idx;
+        }
+        outCount = 0;
+        return nullptr;
+    }
+
+    HRESULT DrawIndexedPrimitive(DWORD type, UINT minIdx, UINT numVerts, UINT startIdx, UINT primCount) {
+        if (!m_streamVB || !m_streamVB->m_data || !m_streamIB || !m_streamIB->m_data) return S_OK;
+        if (primCount == 0 || numVerts == 0) return S_OK;
+        if (m_streamStride == 0) return S_OK;
+
+        FVFLayout l = GetFVFLayout(m_fvf);
+
+        // Inspector record runs on both backends. it's a software
+        // overlay, no GL/bgfx dependency.
+        InspectorRecordDraw(numVerts, m_streamVB->m_data, m_streamStride, l.hasRHW);
+
+        BgfxShadowSubmit(type, minIdx, numVerts, startIdx, primCount);
+        m_frameDrawCalls++;
+        return S_OK;
+    }
+
+    HRESULT DrawPrimitive(DWORD type, UINT start, UINT count) {
+        if (!m_streamVB || !m_streamVB->m_data) return S_OK;
+        const void* data = (const BYTE*)m_streamVB->m_data + start * m_streamStride;
+        return DrawPrimitiveUP(type, count, data, m_streamStride);
+    }
+
+    HRESULT DrawPrimitiveUP(DWORD type, UINT primCount, const void* data, UINT stride) {
+        if (!data || primCount == 0) return S_OK;
+        FVFLayout l = GetFVFLayout(m_fvf);
+
+        UINT vertCount = 0;
+        if (type == D3DPT_TRIANGLELIST) vertCount = primCount * 3;
+        else if (type == D3DPT_TRIANGLESTRIP) vertCount = primCount + 2;
+        else if (type == D3DPT_TRIANGLEFAN) vertCount = primCount + 2;
+        else if (type == D3DPT_QUADLIST) vertCount = primCount * 4;
+        else return S_OK;
+
+        InspectorRecordDraw(vertCount, data, stride, l.hasRHW);
+
+        BgfxShadowSubmitUP(type, primCount, data, stride, vertCount,
+                           /*indexData*/nullptr, /*minIdx*/0);
+        m_frameDrawCalls++;
+        return S_OK;
+    }
+
+    HRESULT DrawIndexedPrimitiveUP(DWORD type, UINT minIdx, UINT numVerts, UINT primCount, const void* indexData, DWORD indexFormat, const void* vertexData, UINT vertexStride) {
+        if (!indexData || !vertexData || primCount == 0 || numVerts == 0) return S_OK;
+        FVFLayout l = GetFVFLayout(m_fvf);
+
+        BgfxShadowSubmitUP(type, primCount, vertexData, vertexStride, numVerts,
+                           (const WORD*)indexData, minIdx);
+        m_frameDrawCalls++;
+        return S_OK;
+    }
+
+    HRESULT CreateTexture(UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT fmt, D3DPOOL pool, IDirect3DTexture8** pp) {
+        IDirect3DTexture8* tex = new IDirect3DTexture8();
+        tex->m_width = w; tex->m_height = h;
+        tex->m_pitch = w * 4;
+        tex->m_pixels = (BYTE*)calloc(w * h, 4);
+        // bgfx upload happens lazily in BgfxEnsureTextureUploaded the
+        // first time this texture binds to a draw. Just mark dirty.
+        tex->m_bgfxDirty = true;
+        *pp = tex; return S_OK;
+    }
+    HRESULT CreateVertexBuffer(UINT length, DWORD usage, DWORD fvf, D3DPOOL pool, IDirect3DVertexBuffer8** pp) { *pp = new IDirect3DVertexBuffer8(length); return S_OK; }
+    HRESULT CreateIndexBuffer(UINT length, DWORD usage, D3DFORMAT fmt, D3DPOOL pool, IDirect3DIndexBuffer8** pp) { *pp = new IDirect3DIndexBuffer8(length); return S_OK; }
+    HRESULT CreateVertexShader(const DWORD* decl, const DWORD* func, DWORD* handle, DWORD usage) { *handle = 0; return S_OK; }
+    HRESULT GetBackBuffer(INT idx, DWORD type, IDirect3DSurface8** pp) { *pp = new IDirect3DSurface8(); return S_OK; }
+    HRESULT SetClipPlane(DWORD idx, D3DVALUE* eq) { return S_OK; }
+};
+typedef IDirect3DDevice8* LPDIRECT3DDEVICE8;
+
+class IDirect3D8 {
+    int m_ref;
+public:
+    IDirect3D8() : m_ref(1) {}
+    ULONG AddRef() { return ++m_ref; }
+    ULONG Release() { if(--m_ref <= 0) { delete this; return 0; } return m_ref; }
+    HRESULT CreateDevice(UINT adapter, DWORD type, void* wnd, DWORD flags, D3DPRESENT_PARAMETERS* pp, IDirect3DDevice8** dev) {
+        *dev = new IDirect3DDevice8();
+        return S_OK;
+    }
+};
+typedef IDirect3D8* LPDIRECT3D8;
+
+inline IDirect3D8* Direct3DCreate8(UINT version) { return new IDirect3D8(); }
+
+// ID3DXMatrixStack stub (Xbox D3DX utility)
+class ID3DXMatrixStack {
+    D3DXMATRIX m_stack[32];
+    int m_top;
+    int m_ref;
+public:
+    ID3DXMatrixStack() : m_top(0), m_ref(1) { D3DXMatrixIdentity(&m_stack[0]); }
+    ULONG AddRef() { return ++m_ref; }
+    ULONG Release() { if(--m_ref<=0){delete this;return 0;} return m_ref; }
+    HRESULT LoadIdentity() { D3DXMatrixIdentity(&m_stack[m_top]); return S_OK; }
+    HRESULT LoadMatrix(const D3DXMATRIX* m) { m_stack[m_top]=*m; return S_OK; }
+    HRESULT MultMatrix(const D3DXMATRIX* m) { m_stack[m_top]=m_stack[m_top]*(*m); return S_OK; }
+    HRESULT MultMatrixLocal(const D3DXMATRIX* m) { m_stack[m_top]=(*m)*m_stack[m_top]; return S_OK; }
+    HRESULT Push() { if(m_top<31){m_stack[m_top+1]=m_stack[m_top];m_top++;} return S_OK; }
+    HRESULT Pop() { if(m_top>0) m_top--; return S_OK; }
+    D3DXMATRIX* GetTop() { return &m_stack[m_top]; }
+    HRESULT RotateAxis(const D3DXVECTOR3* axis, float angle) { D3DXMATRIX r; D3DXMatrixRotationAxis(&r,axis,angle); m_stack[m_top]=m_stack[m_top]*r; return S_OK; }
+    HRESULT RotateAxisLocal(const D3DXVECTOR3* axis, float angle) { D3DXMATRIX r; D3DXMatrixRotationAxis(&r,axis,angle); m_stack[m_top]=r*m_stack[m_top]; return S_OK; }
+    HRESULT Scale(float x, float y, float z) { D3DXMATRIX s; D3DXMatrixScaling(&s,x,y,z); m_stack[m_top]=m_stack[m_top]*s; return S_OK; }
+    HRESULT TranslateLocal(float x, float y, float z) { D3DXMATRIX t; D3DXMatrixTranslation(&t,x,y,z); m_stack[m_top]=t*m_stack[m_top]; return S_OK; }
+    HRESULT Translate(float x, float y, float z) { D3DXMATRIX t; D3DXMatrixTranslation(&t,x,y,z); m_stack[m_top]=m_stack[m_top]*t; return S_OK; }
+};
+inline HRESULT D3DXCreateMatrixStack(DWORD flags, ID3DXMatrixStack** pp) { *pp = new ID3DXMatrixStack(); return S_OK; }
+
+// D3DX texture creation stubs
+#define D3DX_DEFAULT ((UINT)-1)
+#define D3DX_DEFAULT_NONPOW2 ((UINT)-2)
+#define D3DX_FILTER_NONE 1
+
+// Forward-declare XBX parser (defined in xbx_texture.h, included by Image.cpp/xip.cpp)
+IDirect3DTexture8* XBX_ParseTexture(const BYTE* pbContent, int cbContent);
+
+inline HRESULT D3DXCreateTextureFromFileA(IDirect3DDevice8* dev, const char* path, IDirect3DTexture8** ppTex) {
+    (void)dev;
+    *ppTex = NULL;
+    // Try to load the file from the xboxfs-mapped path
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        // Try drive remap (Q:\path -> Data/path, etc.).
+        char mapped[1024];
+        if (path[0] && path[1] == ':' && (path[2] == '\\' || path[2] == '/')) {
+            const char* prefix = XboxFS_DriveToPrefix(path[0]);
+            if (prefix) {
+                snprintf(mapped, sizeof(mapped), "%s/%s", prefix, path + 3);
+                for (char* p = mapped; *p; p++) if (*p == '\\') *p = '/';
+                f = fopen(mapped, "rb");
+            }
+        }
+    }
+    if (!f) return E_FAIL;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0) { fclose(f); return E_FAIL; }
+    BYTE* data = (BYTE*)malloc(size);
+    fread(data, 1, size, f);
+    fclose(f);
+    // Probe XBX only when the file actually starts with the XPR magic;
+    // otherwise XBX_ParseTexture spams a "Bad magic" log on every
+    // JPG/PNG the dashboard loads (Steam icons, .png skin assets, ...).
+    IDirect3DTexture8* tex = NULL;
+    if (size >= (long)sizeof(uint32_t) &&
+        *(const uint32_t*)data == XPR_MAGIC_VALUE) {
+        tex = XBX_ParseTexture(data, (int)size);
+        if (tex) { free(data); *ppTex = tex; return S_OK; }
+    }
+    // Fallback: try stb_image for JPG/PNG/BMP. Route through
+    // CreateFromRGBA so the pixels upload through the bgfx path.
+    {
+        int w = 0, h = 0, ch = 0;
+        unsigned char* pixels = stbi_load_from_memory(data, (int)size, &w, &h, &ch, 4);
+        free(data);
+        if (pixels && w > 0 && h > 0) {
+            tex = new IDirect3DTexture8();
+            tex->CreateFromRGBA((UINT)w, (UINT)h, pixels);
+            stbi_image_free(pixels);
+            *ppTex = tex; return S_OK;
+        }
+    }
+    return E_FAIL;
+}
+
+inline HRESULT D3DXCreateTextureFromFileInMemory(IDirect3DDevice8* dev, const void* data, UINT size, IDirect3DTexture8** ppTex) {
+    (void)dev;
+    *ppTex = NULL;
+    if (!data || size == 0) return E_FAIL;
+    // Magic-gate the XBX probe so non-XBX (JPG/PNG) skips the
+    // "Bad magic" log path. See D3DXCreateTextureFromFileA.
+    IDirect3DTexture8* tex = NULL;
+    if (size >= sizeof(uint32_t) &&
+        *(const uint32_t*)data == XPR_MAGIC_VALUE) {
+        tex = XBX_ParseTexture((const BYTE*)data, (int)size);
+        if (tex) { *ppTex = tex; return S_OK; }
+    }
+    // Fallback: stb_image for JPG/PNG/BMP. Same backend-aware path
+    // as D3DXCreateTextureFromFileA.
+    {
+        int iw = 0, ih = 0, ch = 0;
+        unsigned char* pixels = stbi_load_from_memory((const unsigned char*)data, (int)size, &iw, &ih, &ch, 4);
+        if (pixels && iw > 0 && ih > 0) {
+            tex = new IDirect3DTexture8();
+            tex->CreateFromRGBA((UINT)iw, (UINT)ih, pixels);
+            stbi_image_free(pixels);
+            *ppTex = tex; return S_OK;
+        }
+    }
+    return E_FAIL;
+}
+
+inline HRESULT D3DXCreateTextureFromFileInMemoryEx(IDirect3DDevice8* dev, const void* data, UINT size,
+    UINT w, UINT h, UINT mipLevels, DWORD usage, D3DFORMAT fmt, D3DPOOL pool, DWORD filter, DWORD mipFilter,
+    D3DCOLOR colorKey, void* srcInfo, void* palette, IDirect3DTexture8** ppTex) {
+    (void)dev;(void)w;(void)h;(void)mipLevels;(void)usage;(void)fmt;(void)pool;(void)filter;(void)mipFilter;(void)colorKey;(void)srcInfo;(void)palette;
+    return D3DXCreateTextureFromFileInMemory(dev, data, size, ppTex);
+}
+
+inline HRESULT D3DXCreateTexture(IDirect3DDevice8* dev, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT fmt, D3DPOOL pool, IDirect3DTexture8** ppTex) {
+    return dev->CreateTexture(w, h, levels, usage, fmt, pool, ppTex);
+}
+
+inline HRESULT D3DXCreateMeshFVF(DWORD numFaces, DWORD numVerts, DWORD opts, DWORD fvf, IDirect3DDevice8* dev, ID3DXMesh** ppMesh) {
+    ID3DXMesh* mesh = new ID3DXMesh();
+    mesh->Init(numFaces, numVerts, fvf, dev);
+    *ppMesh = mesh;
+    return S_OK;
+}
+
+// ID3DXMesh::DrawSubset - renders mesh through the device
+inline HRESULT ID3DXMesh::DrawSubset(DWORD attr) {
+    (void)attr;
+    if (!m_dev || !m_vbData || !m_ibData || m_numFaces == 0 || m_numVerts == 0)
+        return S_OK;
+    m_dev->SetVertexShader(m_fvf);
+    m_dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, m_numVerts, m_numFaces,
+        m_ibData, D3DFMT_INDEX16, m_vbData, m_vertStride);
+    return S_OK;
+}
+
+// Per-vertex alpha multiply path. Used by text.cpp VerticalFade so the
+// per-vertex alpha survives falloff lighting. Caller must reset to 0.
+extern LPDIRECT3DDEVICE8 g_pD3DDev;
+inline void TheseusSetVertexAlphaMul(BOOL enable) {
+    if (g_pD3DDev) g_pD3DDev->m_vertexAlphaMul = (enable != 0);
+}
